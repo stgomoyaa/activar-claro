@@ -1,0 +1,19 @@
+# Logs 
+log_completo.txt 
+log_sms.txt 
+fallos_activacion.txt 
+fallos_sin_numero.txt 
+ 
+# Datos 
+listadonumeros_claro.txt 
+ 
+# Python 
+__pycache__/ 
+*.pyc 
+*.pyo 
+ 
+# Otros 
+*.lnk 
+*.bat 
+*.txt 
+*.md 
