@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -157,101 +157,71 @@ def escribir_log(archivo: str, mensaje: str):
 
 
 # ============================
-# 🔄 Sistema de actualización automática
+# 🔄 Sistema de actualización automática (sin Git)
 # ============================
 
+import urllib.request
+import json
+import shutil
+from datetime import datetime
 
-def verificar_git_instalado() -> bool:
-    """Verifica si Git está instalado en el sistema."""
+
+def obtener_version_remota() -> tuple[bool, str, str]:
+    """
+    Obtiene la versión remota del script desde GitHub.
+    Retorna (exito, version, url_descarga).
+    """
     try:
-        subprocess.run(
-            ["git", "--version"],
-            capture_output=True,
-            check=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
+        # URL de la API de GitHub para obtener el contenido del archivo
+        api_url = "https://api.github.com/repos/stgomoyaa/activar-claro/contents/Activar%20Claro%20CNUM%20V3.py"
+        
+        # Hacer request a la API
+        req = urllib.request.Request(api_url)
+        req.add_header('User-Agent', 'Python-Script-Updater')
+        
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            download_url = data.get('download_url')
+            
+            if not download_url:
+                return False, VERSION, ""
+            
+            # Descargar el contenido del script
+            with urllib.request.urlopen(download_url, timeout=5) as file_response:
+                contenido = file_response.read().decode('utf-8')
+                
+                # Buscar la versión en el contenido
+                import re
+                match = re.search(r'VERSION = "([^"]+)"', contenido)
+                
+                if match:
+                    version_remota = match.group(1)
+                    return True, version_remota, download_url
+                    
+        return False, VERSION, ""
+        
+    except Exception as e:
+        return False, VERSION, ""
 
 
-def obtener_directorio_script() -> str:
-    """Obtiene el directorio donde está ubicado el script."""
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def es_repositorio_git(directorio: str) -> bool:
-    """Verifica si el directorio es un repositorio Git."""
-    return os.path.exists(os.path.join(directorio, ".git"))
-
-
-def inicializar_repositorio():
-    """Inicializa el repositorio Git si no existe."""
-    directorio = obtener_directorio_script()
-    
-    if es_repositorio_git(directorio):
-        print("✅ Repositorio Git ya inicializado.")
-        return True
-    
+def comparar_versiones(v1: str, v2: str) -> int:
+    """
+    Compara dos versiones en formato X.Y.Z.
+    Retorna: 1 si v1 > v2, -1 si v1 < v2, 0 si son iguales.
+    """
     try:
-        print("📦 Inicializando repositorio Git...")
+        partes1 = [int(x) for x in v1.split('.')]
+        partes2 = [int(x) for x in v2.split('.')]
         
-        # Inicializar repositorio
-        subprocess.run(
-            ["git", "init"],
-            cwd=directorio,
-            check=True,
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
+        for p1, p2 in zip(partes1, partes2):
+            if p1 > p2:
+                return 1
+            elif p1 < p2:
+                return -1
         
-        # Crear .gitignore
-        gitignore_path = os.path.join(directorio, ".gitignore")
-        with open(gitignore_path, "w", encoding="utf-8") as f:
-            f.write("# Logs\n")
-            f.write("log_completo.txt\n")
-            f.write("log_sms.txt\n")
-            f.write("fallos_activacion.txt\n")
-            f.write("fallos_sin_numero.txt\n")
-            f.write("\n# Datos\n")
-            f.write("listadonumeros_claro.txt\n")
-            f.write("\n# Python\n")
-            f.write("__pycache__/\n")
-            f.write("*.pyc\n")
-            f.write("*.pyo\n")
-            f.write(".venv/\n")
-            f.write("venv/\n")
-        
-        # Agregar archivos
-        subprocess.run(
-            ["git", "add", "."],
-            cwd=directorio,
-            check=True,
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        
-        # Commit inicial
-        subprocess.run(
-            ["git", "commit", "-m", f"Initial commit - Version {VERSION}"],
-            cwd=directorio,
-            check=True,
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        
-        print(f"✅ Repositorio inicializado exitosamente (v{VERSION})")
-        print(f"\n📋 Para subir al repositorio remoto, ejecuta:")
-        print(f"   cd {directorio}")
-        print(f"   git remote add origin {REPO_URL}")
-        print(f"   git branch -M main")
-        print(f"   git push -u origin main\n")
-        
-        return True
-        
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Error al inicializar repositorio: {e}")
-        return False
+        return 0
+    except:
+        return 0
 
 
 def verificar_actualizacion() -> tuple[bool, str]:
@@ -259,72 +229,89 @@ def verificar_actualizacion() -> tuple[bool, str]:
     Verifica si hay una actualización disponible.
     Retorna (hay_actualizacion, version_remota).
     """
-    directorio = obtener_directorio_script()
-    
-    if not es_repositorio_git(directorio):
-        print("⚠️ No es un repositorio Git. Inicializando...")
-        inicializar_repositorio()
-        return False, VERSION
-    
     try:
-        # Configurar remote si no existe
-        result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=directorio,
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        
-        if result.returncode != 0:
-            print("📡 Configurando repositorio remoto...")
-            subprocess.run(
-                ["git", "remote", "add", "origin", REPO_URL],
-                cwd=directorio,
-                check=True,
-                capture_output=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-        
-        # Fetch para obtener cambios
         print("🔍 Verificando actualizaciones...")
-        subprocess.run(
-            ["git", "fetch", "origin", "main"],
-            cwd=directorio,
-            check=True,
-            capture_output=True,
-            timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
+        
+        exito, version_remota, _ = obtener_version_remota()
+        
+        if not exito:
+            print("⚠️ No se pudo verificar actualizaciones.")
+            return False, VERSION
         
         # Comparar versiones
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
-            cwd=directorio,
-            capture_output=True,
-            text=True,
-            check=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        
-        commits_detras = int(result.stdout.strip())
-        
-        if commits_detras > 0:
-            print(f"🆕 ¡Hay {commits_detras} actualización(es) disponible(s)!")
-            return True, "remota"
+        if comparar_versiones(version_remota, VERSION) > 0:
+            print(f"🆕 ¡Nueva versión disponible: v{version_remota} (actual: v{VERSION})!")
+            return True, version_remota
         else:
             print(f"✅ Estás usando la versión más reciente (v{VERSION})")
             return False, VERSION
             
-    except subprocess.TimeoutExpired:
-        print("⏱️ Tiempo de espera agotado al verificar actualizaciones.")
-        return False, VERSION
-    except subprocess.CalledProcessError:
-        print("⚠️ No se pudo verificar actualizaciones (sin conexión o repo no configurado).")
-        return False, VERSION
     except Exception as e:
         print(f"⚠️ Error al verificar actualizaciones: {e}")
         return False, VERSION
+
+
+def descargar_actualizacion(url: str) -> bool:
+    """
+    Descarga la nueva versión del script.
+    Retorna True si se descargó correctamente.
+    """
+    try:
+        script_actual = os.path.abspath(__file__)
+        script_backup = f"{script_actual}.backup"
+        script_temp = f"{script_actual}.new"
+        
+        # Hacer backup del script actual
+        print("💾 Creando respaldo...")
+        shutil.copy2(script_actual, script_backup)
+        
+        # Descargar nueva versión
+        print("📥 Descargando actualización...")
+        
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'Python-Script-Updater')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            contenido = response.read()
+            
+            # Guardar en archivo temporal
+            with open(script_temp, 'wb') as f:
+                f.write(contenido)
+        
+        # Reemplazar el script actual
+        print("🔄 Aplicando actualización...")
+        shutil.move(script_temp, script_actual)
+        
+        print("✅ Script actualizado exitosamente!")
+        print("🔄 Reiniciando con la nueva versión...\n")
+        
+        # Reiniciar el script
+        time.sleep(1)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error al descargar actualización: {e}")
+        
+        # Restaurar backup si existe
+        if os.path.exists(script_backup):
+            print("🔙 Restaurando versión anterior...")
+            try:
+                shutil.copy2(script_backup, script_actual)
+                print("✅ Versión anterior restaurada.")
+            except:
+                pass
+        
+        return False
+    finally:
+        # Limpiar archivos temporales
+        for temp_file in [script_backup, script_temp]:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
 
 
 def actualizar_script() -> bool:
@@ -332,43 +319,17 @@ def actualizar_script() -> bool:
     Actualiza el script a la última versión disponible.
     Retorna True si se actualizó correctamente.
     """
-    directorio = obtener_directorio_script()
-    
     try:
-        print("📥 Descargando actualización...")
+        exito, version_remota, url = obtener_version_remota()
         
-        # Guardar cambios locales (stash)
-        subprocess.run(
-            ["git", "stash"],
-            cwd=directorio,
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
+        if not exito or not url:
+            print("❌ No se pudo obtener la información de actualización.")
+            return False
         
-        # Pull de la última versión
-        result = subprocess.run(
-            ["git", "pull", "origin", "main"],
-            cwd=directorio,
-            capture_output=True,
-            text=True,
-            check=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
+        return descargar_actualizacion(url)
         
-        print("✅ Script actualizado exitosamente!")
-        print("🔄 Reiniciando con la nueva versión...\n")
-        
-        # Reiniciar el script con la nueva versión
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-        
-        return True
-        
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Error al actualizar: {e}")
-        print("💡 Intenta actualizar manualmente con: git pull origin main")
-        return False
     except Exception as e:
-        print(f"❌ Error inesperado al actualizar: {e}")
+        print(f"❌ Error al actualizar: {e}")
         return False
 
 
@@ -378,14 +339,8 @@ def verificar_y_actualizar():
     print(f"🚀 Activador de Chips Claro - Versión {VERSION}")
     print(f"{'='*60}\n")
     
-    if not verificar_git_instalado():
-        print("⚠️ Git no está instalado. El sistema de actualización automática no está disponible.")
-        print("💡 Descarga Git desde: https://git-scm.com/downloads\n")
-        time.sleep(2)
-        return
-    
     try:
-        hay_actualizacion, _ = verificar_actualizacion()
+        hay_actualizacion, version_remota = verificar_actualizacion()
         
         if hay_actualizacion:
             respuesta = input("\n¿Deseas actualizar ahora? (S/n): ").strip().lower()
