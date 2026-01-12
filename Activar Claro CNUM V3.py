@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.2.4"
+VERSION = "3.2.5"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -357,13 +357,8 @@ def verificar_y_actualizar():
         hay_actualizacion, version_remota = verificar_actualizacion()
         
         if hay_actualizacion:
-            respuesta = input("\n¿Deseas actualizar ahora? (S/n): ").strip().lower()
-            
-            if respuesta in ["s", "si", "sí", "yes", "y", ""]:
-                actualizar_script()
-            else:
-                print("⏭️ Actualización omitida. Continuando con la versión actual...\n")
-                time.sleep(1)
+            print(f"\n🔄 Actualizando automáticamente a v{version_remota}...")
+            actualizar_script()
         else:
             time.sleep(1)
             
