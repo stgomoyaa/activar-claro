@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.2.2"
+VERSION = "3.2.3"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -165,6 +165,7 @@ import urllib.request
 import json
 import shutil
 from datetime import datetime
+import ssl
 
 
 def obtener_version_remota() -> tuple[bool, str, str]:
@@ -180,7 +181,12 @@ def obtener_version_remota() -> tuple[bool, str, str]:
         req = urllib.request.Request(api_url)
         req.add_header('User-Agent', 'Python-Script-Updater')
         
-        with urllib.request.urlopen(req, timeout=10) as response:
+        # Crear contexto SSL que no verifica certificados (para servidores con problemas de SSL)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
             data = json.loads(response.read().decode())
             download_url = data.get('download_url')
             
@@ -189,7 +195,7 @@ def obtener_version_remota() -> tuple[bool, str, str]:
                 return False, VERSION, ""
             
             # Descargar el contenido del script
-            with urllib.request.urlopen(download_url, timeout=10) as file_response:
+            with urllib.request.urlopen(download_url, timeout=10, context=ctx) as file_response:
                 contenido = file_response.read().decode('utf-8')
                 
                 # Buscar la versión en el contenido
@@ -274,7 +280,12 @@ def descargar_actualizacion(url: str) -> bool:
         req = urllib.request.Request(url)
         req.add_header('User-Agent', 'Python-Script-Updater')
         
-        with urllib.request.urlopen(req, timeout=10) as response:
+        # Crear contexto SSL que no verifica certificados
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
             contenido = response.read()
             
             # Guardar en archivo temporal
