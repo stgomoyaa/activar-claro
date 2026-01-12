@@ -82,8 +82,18 @@ def obtener_registros_existentes(conn):
         return set(), set()
 
 
-def insertar_registro_worker(numero, iccid, resultado_queue, lock_print):
+def insertar_registro_worker(numero, iccid, resultado_queue, lock_print, registros_insertados_lock, registros_insertados):
     """Worker que inserta un registro en la base de datos (ejecutado en un hilo)"""
+    # Verificar si ya fue insertado por otro hilo en esta ejecución
+    with registros_insertados_lock:
+        if (numero, iccid) in registros_insertados:
+            with lock_print:
+                print(f"⏭️ Ya procesado: {numero} = {iccid}")
+            resultado_queue.put(('ya_procesado', numero, iccid))
+            return
+        registros_insertados.add((numero, iccid))
+    
+    conn = None
     try:
         # Cada hilo crea su propia conexión
         conn = psycopg2.connect(**DB_CONFIG)
@@ -98,7 +108,6 @@ def insertar_registro_worker(numero, iccid, resultado_queue, lock_print):
         
         conn.commit()
         cursor.close()
-        conn.close()
         
         with lock_print:
             print(f"✅ Insertado: {numero} = {iccid}")
@@ -106,13 +115,23 @@ def insertar_registro_worker(numero, iccid, resultado_queue, lock_print):
         resultado_queue.put(('exito', numero, iccid))
         
     except psycopg2.IntegrityError:
+        if conn:
+            conn.rollback()
         with lock_print:
-            print(f"⚠️ Duplicado: {numero} = {iccid}")
+            print(f"⚠️ Duplicado en BD: {numero} = {iccid}")
         resultado_queue.put(('duplicado', numero, iccid))
     except Exception as e:
+        if conn:
+            conn.rollback()
         with lock_print:
-            print(f"❌ Error: {numero} = {iccid} ({e})")
+            print(f"❌ Error: {numero} = {iccid} ({str(e)[:50]})")
         resultado_queue.put(('error', numero, iccid))
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
 
 
 def insertar_registros_paralelo(registros_nuevos, max_hilos=10):
@@ -123,7 +142,8 @@ def insertar_registros_paralelo(registros_nuevos, max_hilos=10):
     
     resultado_queue = Queue()
     lock_print = threading.Lock()
-    hilos = []
+    registros_insertados_lock = threading.Lock()
+    registros_insertados = set()
     
     print(f"🚀 Iniciando inserción con {max_hilos} hilos paralelos...\n")
     
@@ -138,7 +158,7 @@ def insertar_registros_paralelo(registros_nuevos, max_hilos=10):
         for numero, iccid in lote:
             hilo = threading.Thread(
                 target=insertar_registro_worker,
-                args=(numero, iccid, resultado_queue, lock_print)
+                args=(numero, iccid, resultado_queue, lock_print, registros_insertados_lock, registros_insertados)
             )
             hilo.start()
             hilos_lote.append(hilo)
@@ -155,6 +175,7 @@ def insertar_registros_paralelo(registros_nuevos, max_hilos=10):
     exitosos = 0
     duplicados = 0
     errores = 0
+    ya_procesados = 0
     
     while not resultado_queue.empty():
         resultado, _, _ = resultado_queue.get()
@@ -164,12 +185,17 @@ def insertar_registros_paralelo(registros_nuevos, max_hilos=10):
             duplicados += 1
         elif resultado == 'error':
             errores += 1
+        elif resultado == 'ya_procesado':
+            ya_procesados += 1
     
     print(f"\n{'='*60}")
     print(f"📈 Resultados finales:")
     print(f"   ✅ Insertados exitosamente: {exitosos}")
-    print(f"   ⚠️  Duplicados encontrados: {duplicados}")
+    print(f"   ⚠️  Duplicados en BD: {duplicados}")
+    if ya_procesados > 0:
+        print(f"   ⏭️  Ya procesados (evitados): {ya_procesados}")
     print(f"   ❌ Errores: {errores}")
+    print(f"   📊 Total procesado: {exitosos + duplicados + ya_procesados + errores}/{total}")
     print(f"{'='*60}\n")
     
     return exitosos
