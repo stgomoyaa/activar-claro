@@ -3,9 +3,28 @@ Script para sincronizar listadonumeros_claro.txt con la base de datos PostgreSQL
 Sube solo los registros únicos que no existen en la base de datos.
 """
 
+import subprocess
+import sys
+
+# Librerías requeridas (instalación bajo demanda)
+REQUIRED_LIBS = [
+    "psycopg2-binary",
+]
+
+
+def instalar_libreria(libreria: str):
+    try:
+        __import__(libreria.replace('-binary', ''))  # psycopg2-binary se importa como psycopg2
+    except ImportError:
+        print(f"📦 Instalando {libreria}…")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", libreria])
+
+
+for _lib in REQUIRED_LIBS:
+    instalar_libreria(_lib)
+
 import psycopg2
 from datetime import datetime
-import sys
 import threading
 from queue import Queue
 
