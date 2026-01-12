@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.2.3"
+VERSION = "3.2.4"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -879,6 +879,46 @@ def guardar_resultado(iccid, numero, puerto):
         )
 
 
+def exportar_base_datos_completa():
+    """Exporta toda la base de datos PostgreSQL al archivo local listadonumeros_claro.txt"""
+    try:
+        escribir_log(LOG_COMPLETO, "📥 Exportando listado completo desde la base de datos...")
+        
+        conn = psycopg2.connect(
+            host="crossover.proxy.rlwy.net",
+            database="railway",
+            user="postgres",
+            password="QOHmELJXXFPmWBlyFmgtjLMvZfeoFaJa",
+            port=43307
+        )
+        cursor = conn.cursor()
+        
+        # Obtener todos los registros de la base de datos
+        cursor.execute("SELECT numero_telefono, iccid FROM claro_numbers ORDER BY fecha_activacion")
+        registros = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        # Escribir todos los registros al archivo (sobrescribir)
+        with open("listadonumeros_claro.txt", "w", encoding="utf-8") as archivo:
+            for numero, iccid in registros:
+                archivo.write(f"{numero}={iccid}\n")
+        
+        escribir_log(
+            LOG_COMPLETO,
+            f"✅ Exportados {len(registros)} registros desde la base de datos al archivo local.",
+        )
+        return True
+        
+    except Exception as e:
+        escribir_log(
+            LOG_COMPLETO,
+            f"❌ Error al exportar la base de datos: {e}",
+        )
+        return False
+
+
 # ============================
 # 🔄 Función procesar_puerto (refactor clave)
 # ============================
@@ -1061,5 +1101,9 @@ if __name__ == "__main__":
     while contador < 2:
         main()
         contador += 1
+    
+    # Exportar toda la base de datos al archivo local
+    exportar_base_datos_completa()
+    
     limpiar_listado()
     abrir_simclient()
