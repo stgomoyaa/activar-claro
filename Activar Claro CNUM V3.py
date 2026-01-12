@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.2.5"
+VERSION = "3.2.6"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -841,7 +841,7 @@ def guardar_resultado(iccid, numero, puerto):
         f"✅ [{puerto}] Número {numero} guardado en la SIM como 'myphone'.",
     )
     
-    # Subir a la base de datos PostgreSQL
+    # Subir a la base de datos PostgreSQL (actualizar si existe, insertar si no)
     try:
         conn = psycopg2.connect(
             host="crossover.proxy.rlwy.net",
@@ -854,19 +854,36 @@ def guardar_resultado(iccid, numero, puerto):
         
         fecha_actual = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        cursor.execute(
-            "INSERT INTO claro_numbers (iccid, numero_telefono, fecha_activacion) VALUES (%s, %s, %s)",
-            (iccid, numero, fecha_actual)
-        )
+        # Primero verificar si el ICCID ya existe
+        cursor.execute("SELECT numero_telefono FROM claro_numbers WHERE iccid = %s", (iccid,))
+        registro_existente = cursor.fetchone()
+        
+        if registro_existente:
+            # Si existe, actualizar con el nuevo número (reciclado por la compañía)
+            numero_anterior = registro_existente[0]
+            cursor.execute(
+                "UPDATE claro_numbers SET numero_telefono = %s, fecha_activacion = %s WHERE iccid = %s",
+                (numero, fecha_actual, iccid)
+            )
+            escribir_log(
+                LOG_COMPLETO,
+                f"🔄 [{puerto}] ICCID {iccid} actualizado: {numero_anterior} → {numero}",
+            )
+        else:
+            # Si no existe, insertar como nuevo registro
+            cursor.execute(
+                "INSERT INTO claro_numbers (iccid, numero_telefono, fecha_activacion) VALUES (%s, %s, %s)",
+                (iccid, numero, fecha_actual)
+            )
+            escribir_log(
+                LOG_COMPLETO,
+                f"✅ [{puerto}] Número {numero} e ICCID {iccid} guardados en la base de datos.",
+            )
         
         conn.commit()
         cursor.close()
         conn.close()
         
-        escribir_log(
-            LOG_COMPLETO,
-            f"✅ [{puerto}] Número {numero} e ICCID {iccid} guardados en la base de datos.",
-        )
     except Exception as e:
         escribir_log(
             LOG_COMPLETO,
