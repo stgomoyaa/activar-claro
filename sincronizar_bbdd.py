@@ -6,6 +6,8 @@ Sube solo los registros únicos que no existen en la base de datos.
 import psycopg2
 from datetime import datetime
 import sys
+import threading
+from queue import Queue
 
 # Configuración de la base de datos
 DB_CONFIG = {
@@ -61,43 +63,97 @@ def obtener_registros_existentes(conn):
         return set(), set()
 
 
-def insertar_registros(conn, registros_nuevos):
-    """Inserta los registros nuevos en la base de datos"""
+def insertar_registro_worker(numero, iccid, resultado_queue, lock_print):
+    """Worker que inserta un registro en la base de datos (ejecutado en un hilo)"""
+    try:
+        # Cada hilo crea su propia conexión
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        fecha_actual = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        cursor.execute(
+            "INSERT INTO claro_numbers (iccid, numero_telefono, fecha_activacion) VALUES (%s, %s, %s)",
+            (iccid, numero, fecha_actual)
+        )
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        with lock_print:
+            print(f"✅ Insertado: {numero} = {iccid}")
+        
+        resultado_queue.put(('exito', numero, iccid))
+        
+    except psycopg2.IntegrityError:
+        with lock_print:
+            print(f"⚠️ Duplicado: {numero} = {iccid}")
+        resultado_queue.put(('duplicado', numero, iccid))
+    except Exception as e:
+        with lock_print:
+            print(f"❌ Error: {numero} = {iccid} ({e})")
+        resultado_queue.put(('error', numero, iccid))
+
+
+def insertar_registros_paralelo(registros_nuevos, max_hilos=10):
+    """Inserta los registros usando múltiples hilos"""
     if not registros_nuevos:
         print("ℹ️ No hay registros nuevos para insertar.")
         return 0
     
-    try:
-        cursor = conn.cursor()
-        fecha_actual = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        insertados = 0
-        for numero, iccid in registros_nuevos:
-            try:
-                cursor.execute(
-                    "INSERT INTO claro_numbers (iccid, numero_telefono, fecha_activacion) VALUES (%s, %s, %s)",
-                    (iccid, numero, fecha_actual)
-                )
-                insertados += 1
-            except psycopg2.IntegrityError:
-                # Si hay un error de integridad (duplicado), continuar con el siguiente
-                conn.rollback()
-                continue
-            except Exception as e:
-                print(f"⚠️ Error al insertar {numero}={iccid}: {e}")
-                conn.rollback()
-                continue
-        
-        conn.commit()
-        cursor.close()
-        
-        print(f"✅ Insertados {insertados} registros nuevos en la base de datos.")
-        return insertados
+    resultado_queue = Queue()
+    lock_print = threading.Lock()
+    hilos = []
     
-    except Exception as e:
-        print(f"❌ Error al insertar registros: {e}")
-        conn.rollback()
-        return 0
+    print(f"🚀 Iniciando inserción con {max_hilos} hilos paralelos...\n")
+    
+    # Crear e iniciar hilos en lotes
+    total = len(registros_nuevos)
+    procesados = 0
+    
+    for i in range(0, total, max_hilos):
+        lote = registros_nuevos[i:i+max_hilos]
+        hilos_lote = []
+        
+        for numero, iccid in lote:
+            hilo = threading.Thread(
+                target=insertar_registro_worker,
+                args=(numero, iccid, resultado_queue, lock_print)
+            )
+            hilo.start()
+            hilos_lote.append(hilo)
+        
+        # Esperar a que termine este lote antes de continuar con el siguiente
+        for hilo in hilos_lote:
+            hilo.join()
+        
+        procesados += len(lote)
+        with lock_print:
+            print(f"\n📊 Progreso: {procesados}/{total} ({(procesados/total)*100:.1f}%)\n")
+    
+    # Contar resultados
+    exitosos = 0
+    duplicados = 0
+    errores = 0
+    
+    while not resultado_queue.empty():
+        resultado, _, _ = resultado_queue.get()
+        if resultado == 'exito':
+            exitosos += 1
+        elif resultado == 'duplicado':
+            duplicados += 1
+        elif resultado == 'error':
+            errores += 1
+    
+    print(f"\n{'='*60}")
+    print(f"📈 Resultados finales:")
+    print(f"   ✅ Insertados exitosamente: {exitosos}")
+    print(f"   ⚠️  Duplicados encontrados: {duplicados}")
+    print(f"   ❌ Errores: {errores}")
+    print(f"{'='*60}\n")
+    
+    return exitosos
 
 
 def sincronizar():
@@ -146,17 +202,17 @@ def sincronizar():
         print(f"   • Registros únicos a insertar: {len(registros_nuevos)}")
         print()
         
-        # Insertar registros nuevos
+        # Cerrar conexión principal
+        conn.close()
+        
+        # Insertar registros nuevos usando hilos
         if registros_nuevos:
-            print("📤 Insertando registros nuevos...")
-            insertados = insertar_registros(conn, registros_nuevos)
-            print()
+            print("📤 Insertando registros nuevos...\n")
+            insertados = insertar_registros_paralelo(registros_nuevos, max_hilos=20)
             print(f"✅ Proceso completado: {insertados} registros insertados.")
         else:
             print("✅ Todos los registros ya existen en la base de datos.")
         
-        # Cerrar conexión
-        conn.close()
         print()
         print("=" * 60)
         
