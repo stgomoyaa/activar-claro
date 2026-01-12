@@ -39,6 +39,7 @@ REQUIRED_LIBS = [
     "psutil",
     "Pillow",
     "smspdudecoder",
+    "psycopg2-binary",
 ]
 
 
@@ -55,6 +56,7 @@ for _lib in REQUIRED_LIBS:
 
 from smspdudecoder.easy import read_incoming_sms
 import psutil  # noqa: E402  (después de instalación condicional)
+import psycopg2  # noqa: E402  (después de instalación condicional)
 
 # ============================
 # 🔒 Locks y estructuras globales
@@ -67,7 +69,6 @@ sim_sin_numero = set()
 
 activaciones_claro = 0
 total_claro = 0
-totalEarns = 0
 
 contadores_lock = threading.Lock()
 sim_set_lock = threading.Lock()
@@ -654,9 +655,7 @@ def validar_modems_activos(puertos):
         hilo.start()
     for hilo in hilos:
         hilo.join()
-    earns = (len(modems_activos) * 0.5) * 934
     escribir_log(LOG_COMPLETO, f"📡 Módems activos detectados: {modems_activos}")
-    escribir_log(LOG_COMPLETO, f"📡 Ganancias detectadas: ${earns} CLP .")
     return modems_activos
 
 
@@ -819,7 +818,7 @@ def limpiar_listado(path: str = LISTADO_NUMEROS):
 
 
 def guardar_resultado(iccid, numero, puerto):
-    """Guarda el número en un archivo y lo asigna a la tarjeta SIM."""
+    """Guarda el número en un archivo, lo asigna a la tarjeta SIM y lo sube a PostgreSQL."""
     # Guardar en el archivo
     with open("listadonumeros_claro.txt", "a") as archivo:
         archivo.write(f"{numero}={iccid}\n")
@@ -833,9 +832,39 @@ def guardar_resultado(iccid, numero, puerto):
         LOG_COMPLETO,
         f"✅ [{puerto}] Número {numero} guardado en la SIM como 'myphone'.",
     )
+    
+    # Subir a la base de datos PostgreSQL
+    try:
+        conn = psycopg2.connect(
+            host="crossover.proxy.rlwy.net",
+            database="railway",
+            user="postgres",
+            password="QOHmELJXXFPmWBlyFmgtjLMvZfeoFaJa",
+            port=43307
+        )
+        cursor = conn.cursor()
+        
+        fecha_actual = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        cursor.execute(
+            "INSERT INTO claro_numbers (iccid, numero_telefono, fecha_activacion) VALUES (%s, %s, %s)",
+            (iccid, numero, fecha_actual)
+        )
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        escribir_log(
+            LOG_COMPLETO,
+            f"✅ [{puerto}] Número {numero} e ICCID {iccid} guardados en la base de datos.",
+        )
+    except Exception as e:
+        escribir_log(
+            LOG_COMPLETO,
+            f"❌ [{puerto}] Error al guardar en la base de datos: {e}",
+        )
 
-
-totalEarns = 0
 
 # ============================
 # 🔄 Función procesar_puerto (refactor clave)
@@ -843,7 +872,7 @@ totalEarns = 0
 
 
 def procesar_puerto(puerto: str):
-    global activaciones_claro, total_claro, totalEarns
+    global activaciones_claro, total_claro
 
     with ModemSession(puerto) as _sesion:  # la sesión queda activa para el hilo
         iccid = obtener_iccid(puerto)
@@ -871,7 +900,6 @@ def procesar_puerto(puerto: str):
             if numero_obtenido:
                 guardar_resultado(iccid, numero_obtenido, puerto)
                 with contadores_lock:
-                    totalEarns += 654
                     if operador == "Claro":
                         activaciones_claro += 1
             else:
@@ -886,9 +914,6 @@ def procesar_puerto(puerto: str):
             escribir_log(
                 LOG_COMPLETO, f"❌ [{puerto}] No se obtuvo número tras 3 intentos."
             )
-
-        with contadores_lock:
-            escribir_log(LOG_COMPLETO, f"🏦 Ganaste {totalEarns} en esta tandita.")
 
 
 # ============================
@@ -982,7 +1007,6 @@ def main():
 
     escribir_log(LOG_COMPLETO, "📊 Resumen de activaciones:")
     escribir_log(LOG_COMPLETO, f"Claro: {activaciones_claro}/{total_claro}")
-    escribir_log(LOG_COMPLETO, f"🏦 Ganaste: ${totalEarns}")
     escribir_log(LOG_COMPLETO, "✅ Todos los procesos de activación finalizados.")
 
     opcion = input_con_timeout(
