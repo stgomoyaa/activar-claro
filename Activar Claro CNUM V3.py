@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.2.1"
+VERSION = "3.2.2"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -180,15 +180,16 @@ def obtener_version_remota() -> tuple[bool, str, str]:
         req = urllib.request.Request(api_url)
         req.add_header('User-Agent', 'Python-Script-Updater')
         
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode())
             download_url = data.get('download_url')
             
             if not download_url:
+                print("⚠️ No se encontró URL de descarga en la respuesta de GitHub")
                 return False, VERSION, ""
             
             # Descargar el contenido del script
-            with urllib.request.urlopen(download_url, timeout=5) as file_response:
+            with urllib.request.urlopen(download_url, timeout=10) as file_response:
                 contenido = file_response.read().decode('utf-8')
                 
                 # Buscar la versión en el contenido
@@ -202,6 +203,7 @@ def obtener_version_remota() -> tuple[bool, str, str]:
         return False, VERSION, ""
         
     except Exception as e:
+        print(f"⚠️ Error al verificar actualizaciones: {e}")
         return False, VERSION, ""
 
 
