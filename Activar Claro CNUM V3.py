@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
