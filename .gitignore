@@ -1,0 +1,25 @@
+# Logs de corrida
+log_completo.txt
+log_sms.txt
+log_restauracion.txt
+log_triage.txt
+fallos_activacion.txt
+fallos_sin_numero.txt
+
+# Datos de la flota: NUNCA versionar, tiene los pares numero/ICCID
+listadonumeros_claro.txt
+
+# Credencial local del auto-update
+github_token.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.backup
+*.new
+
+# Windows
+*.lnk
+*.ink
+*.bat
