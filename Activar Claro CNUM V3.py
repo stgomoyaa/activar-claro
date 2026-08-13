@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -170,9 +170,22 @@ class ModemSession:
     def __enter__(self):
         self.lock = _get_port_lock(self.puerto)
         self.lock.acquire()
-        self.ser = serial.Serial(
-            self.puerto, baudrate=self.baudrate, timeout=self.timeout
-        )
+        try:
+            # write_timeout: sin él la escritura bloquea para siempre si el
+            # módem deja de aceptar bytes. `timeout` solo cubre la lectura.
+            self.ser = serial.Serial(
+                self.puerto,
+                baudrate=self.baudrate,
+                timeout=self.timeout,
+                write_timeout=self.timeout,
+            )
+        except Exception:
+            # Si el puerto no abre, `__exit__` NUNCA se ejecuta (el `with` no
+            # llegó a entrar) y el lock quedaba tomado para siempre: cualquier
+            # comando posterior a ese puerto se colgaba. Soltarlo acá.
+            self.lock.release()
+            self.lock = None
+            raise
         _open_sessions[self.puerto] = self.ser
         return self
 
@@ -204,6 +217,113 @@ def escribir_log(archivo: str, mensaje: str):
     print(mensaje)
     with open(archivo, "a", encoding="utf-8", newline="\n") as f:
         f.write(mensaje + "\n")
+
+
+# ============================
+# 🧵 Barrera de hilos con deadline
+# ============================
+# Un módem con el stack USB colgado bloquea PARA SIEMPRE dentro de
+# `serial.Serial()` (en Windows CreateFile no acepta timeout) o dentro de
+# `ser.write()` (write_timeout=None = infinito). Como todos los `hilo.join()`
+# eran sin timeout, un solo puerto trabado congelaba la corrida completa: los
+# otros 95 módems ya listos quedaban esperándolo eternamente y el script no
+# volvía nunca. Ahora cada barrera tiene un plazo global; el hilo trabado se
+# abandona (es daemon, así que no impide que el intérprete salga) y su puerto
+# queda marcado como muerto para no volver a pagarle el plazo en la 2ª pasada.
+
+puertos_muertos = set()
+puertos_muertos_lock = threading.Lock()
+
+# Plazos por etapa, en segundos. Generosos a propósito: un plazo corto recorta
+# la flota en silencio, que es peor que el cuelgue porque nadie se entera.
+DEADLINE_CIERRE = 45  # abrir+cerrar puerto, sano ≈ 1s
+DEADLINE_VALIDACION = 60  # AT + espera de 1s, sano ≈ 2s
+DEADLINE_LECTURA = 240  # ICCID (hasta 30s) + agenda, sano ≈ 40s
+DEADLINE_BORRADO = 180  # AT+CMGD por puerto
+DEADLINE_ACTIVACION = 600  # 3 intentos de USSD + SMS, sano ≈ 150s
+
+
+def marcar_puerto_muerto(puerto: str, etapa: str):
+    """Deja el puerto fuera del resto de la corrida y lo avisa una sola vez."""
+    with puertos_muertos_lock:
+        es_nuevo = puerto not in puertos_muertos
+        puertos_muertos.add(puerto)
+
+    if es_nuevo:
+        escribir_log(
+            LOG_COMPLETO,
+            f"☠️ [{puerto}] Colgado en {etapa}: no contestó dentro del plazo. "
+            "Queda excluido del resto de la corrida (revisar ese hub USB).",
+        )
+
+
+def filtrar_muertos(puertos):
+    """Saca de la lista los puertos que ya se colgaron en una etapa previa."""
+    with puertos_muertos_lock:
+        return [p for p in puertos if p not in puertos_muertos]
+
+
+def correr_en_hilos(
+    objetivo,
+    puertos,
+    deadline: float,
+    etapa: str,
+    args_extra: tuple = (),
+    marcar_muertos: bool = True,
+) -> list:
+    """Corre `objetivo(puerto, *args_extra)` en un hilo por puerto, con plazo.
+
+    El plazo es global para toda la barrera, no por hilo: con 97 puertos, un
+    `join(5)` por hilo daría 485s en el peor caso. Devuelve la lista de puertos
+    que seguían vivos al vencer el plazo.
+
+    `marcar_muertos=False` para etapas best-effort (limpieza), donde vencer el
+    plazo no es evidencia de que el módem esté colgado y excluirlo del resto de
+    la corrida costaría chips que sí servían.
+    """
+    hilos = []
+    for puerto in puertos:
+        hilo = threading.Thread(
+            target=objetivo, args=(puerto, *args_extra), daemon=True
+        )
+        hilos.append((puerto, hilo))
+        hilo.start()
+
+    limite = time.monotonic() + deadline
+    colgados = []
+    for puerto, hilo in hilos:
+        hilo.join(max(limite - time.monotonic(), 0))
+        if hilo.is_alive():
+            colgados.append(puerto)
+
+    if not colgados:
+        return []
+
+    escribir_log(
+        LOG_COMPLETO,
+        f"⏱ {etapa}: {len(colgados)} puerto(s) sin terminar tras {deadline:.0f}s "
+        f"{colgados}. Sigo con los {len(hilos) - len(colgados)} que sí contestaron.",
+    )
+
+    if not marcar_muertos:
+        return colgados
+
+    # Si venció más de la mitad, el problema no son los módems: está lento el PC
+    # (antivirus, stack USB saturado, DB colgada). Blacklistear media flota por
+    # eso deja chips sin vender, que es peor que esperar. La firma de un módem
+    # realmente colgado es un outlier solo, como el COM49 que originó este fix.
+    if len(colgados) > len(hilos) // 2:
+        escribir_log(
+            LOG_COMPLETO,
+            f"⚠️ {etapa}: venció el plazo con {len(colgados)}/{len(hilos)} vivos. "
+            "Eso es lentitud general, no módems colgados: no marco ninguno como muerto.",
+        )
+        return colgados
+
+    for puerto in colgados:
+        marcar_puerto_muerto(puerto, etapa)
+
+    return colgados
 
 
 # ============================
@@ -618,7 +738,9 @@ def enviar_comando(puerto: str, comando: str, espera: float = 1):
     lock = _get_port_lock(puerto)
     with lock:
         try:
-            with serial.Serial(puerto, baudrate=115200, timeout=2) as ser:
+            with serial.Serial(
+                puerto, baudrate=115200, timeout=2, write_timeout=2
+            ) as ser:
                 ser.write((comando + "\r\n").encode())
                 time.sleep(espera)
                 respuesta = ser.read_all().decode(errors="ignore").strip()
@@ -644,14 +766,17 @@ def cerrar_puertos_serial():
         except:
             pass
 
-    hilos = []
-    for p in serial.tools.list_ports.comports():
-        hilo = threading.Thread(target=cerrar_puerto, args=(p.device,))
-        hilo.start()
-        hilos.append(hilo)
-
-    for h in hilos:
-        h.join()
+    # marcar_muertos=False a propósito: esto es limpieza best-effort y corre
+    # justo después del taskkill de HeroSMS, cuando Windows todavía está
+    # soltando los 97 handles que tenía el otro proceso. Un open lento acá NO
+    # significa módem colgado; excluirlo de la corrida costaría chips buenos.
+    correr_en_hilos(
+        cerrar_puerto,
+        [p.device for p in serial.tools.list_ports.comports()],
+        DEADLINE_CIERRE,
+        "cierre de puertos",
+        marcar_muertos=False,
+    )
 
     print("⏳ Esperando 2 segundos para asegurar cierre de puertos...")
     time.sleep(2)
@@ -765,15 +890,12 @@ def borrar_mensajes_global(puertos):
     """Borra los mensajes de todos los módems en paralelo utilizando hilos."""
     escribir_log(LOG_COMPLETO, "🗑 Iniciando borrado de mensajes en todos los módems...")
 
-    hilos = [
-        threading.Thread(target=borrar_mensajes_modem, args=(puerto,))
-        for puerto in puertos
-    ]
-
-    for hilo in hilos:
-        hilo.start()
-    for hilo in hilos:
-        hilo.join()
+    correr_en_hilos(
+        borrar_mensajes_modem,
+        filtrar_muertos(puertos),
+        DEADLINE_BORRADO,
+        "borrado de mensajes",
+    )
 
     escribir_log(LOG_COMPLETO, "✅ Borrado de mensajes completado.")
 
@@ -791,17 +913,15 @@ def repetir_proceso_sinsims():
 
     escribir_log(LOG_COMPLETO, f"🔄 Reintentando activación en: {list(sim_sin_numero)}")
 
-    puertos_a_reintentar = list(sim_sin_numero)
+    puertos_a_reintentar = filtrar_muertos(list(sim_sin_numero))
     sim_sin_numero.clear()  # Limpiar la lista para registrar solo nuevos fallos
 
-    hilos = [
-        threading.Thread(target=procesar_puerto, args=(puerto,))
-        for puerto in puertos_a_reintentar
-    ]
-    for hilo in hilos:
-        hilo.start()
-    for hilo in hilos:
-        hilo.join()
+    correr_en_hilos(
+        procesar_puerto,
+        puertos_a_reintentar,
+        DEADLINE_ACTIVACION,
+        "reintento de activación",
+    )
 
     escribir_log(LOG_COMPLETO, "✅ Reintento finalizado.")
 
@@ -829,7 +949,7 @@ def revisar_puerto(puerto, resultado, reiniciar=True):
     reinicio solo hace falta antes de activar.
     """
     try:
-        with serial.Serial(puerto, baudrate=115200, timeout=2) as ser:
+        with serial.Serial(puerto, baudrate=115200, timeout=2, write_timeout=2) as ser:
             ser.write(b"AT\r\n")
             time.sleep(1)
             respuesta = ser.read_all().decode(errors="ignore").strip()
@@ -856,17 +976,17 @@ def validar_modems_activos(puertos, reiniciar=True):
     escribir_log(LOG_COMPLETO, "🔍 Iniciando validación de módems activos...")
 
     modems_activos = []
-    hilos = [
-        threading.Thread(
-            target=revisar_puerto, args=(puerto, modems_activos, reiniciar)
-        )
-        for puerto in puertos
-    ]
+    correr_en_hilos(
+        revisar_puerto,
+        filtrar_muertos(puertos),
+        DEADLINE_VALIDACION,
+        "validación de módems",
+        args_extra=(modems_activos, reiniciar),
+    )
 
-    for hilo in hilos:
-        hilo.start()
-    for hilo in hilos:
-        hilo.join()
+    # Filtrar de nuevo: un hilo abandonado que se destrabe después del plazo
+    # podría alcanzar a agregar su puerto a la lista.
+    modems_activos = filtrar_muertos(modems_activos)
     escribir_log(LOG_COMPLETO, f"📡 Módems activos detectados: {modems_activos}")
     return modems_activos
 
@@ -1324,14 +1444,13 @@ def fase_triage(modems_activos: list) -> dict:
     escribir_log(LOG_TRIAGE, "=" * 60)
 
     inventario: dict = {}
-    hilos = [
-        threading.Thread(target=inspeccionar_puerto, args=(puerto, inventario))
-        for puerto in modems_activos
-    ]
-    for hilo in hilos:
-        hilo.start()
-    for hilo in hilos:
-        hilo.join()
+    correr_en_hilos(
+        inspeccionar_puerto,
+        filtrar_muertos(modems_activos),
+        DEADLINE_LECTURA,
+        "triage de flota",
+        args_extra=(inventario,),
+    )
 
     return inventario
 
@@ -1570,16 +1689,13 @@ def fase_restauracion(modems_activos: list) -> dict:
         )
 
     inventario: dict = {}
-    hilos = [
-        threading.Thread(
-            target=restaurar_puerto, args=(puerto, indice, inventario, desde_db)
-        )
-        for puerto in modems_activos
-    ]
-    for hilo in hilos:
-        hilo.start()
-    for hilo in hilos:
-        hilo.join()
+    correr_en_hilos(
+        restaurar_puerto,
+        filtrar_muertos(modems_activos),
+        DEADLINE_LECTURA,
+        "fase 0 (recuperación)",
+        args_extra=(indice, inventario, desde_db),
+    )
 
     escribir_log(LOG_RESTAURACION, "-" * 60)
     escribir_log(
@@ -1601,6 +1717,14 @@ def fase_restauracion(modems_activos: list) -> dict:
 
 
 def procesar_puerto(puerto: str):
+    """Wrapper: un puerto que revienta no debe tirar un traceback pelado."""
+    try:
+        _procesar_puerto(puerto)
+    except Exception as e:
+        escribir_log(LOG_COMPLETO, f"❌ [{puerto}] Error procesando el puerto: {e}")
+
+
+def _procesar_puerto(puerto: str):
     global activaciones_claro, total_claro
 
     with ModemSession(puerto) as _sesion:  # la sesión queda activa para el hilo
@@ -1737,14 +1861,12 @@ def main() -> str:
         escribir_log(LOG_COMPLETO, f"🚀 Procesando lote {i + 1}/{total_lotes}: {lote}")
 
         tiempo_inicio = time.time()
-        hilos = [
-            threading.Thread(target=procesar_puerto, args=(puerto,)) for puerto in lote
-        ]
-
-        for hilo in hilos:
-            hilo.start()
-        for hilo in hilos:
-            hilo.join()
+        correr_en_hilos(
+            procesar_puerto,
+            filtrar_muertos(lote),
+            DEADLINE_ACTIVACION,
+            f"activación lote {i + 1}/{total_lotes}",
+        )
 
         tiempo_transcurrido = time.time() - tiempo_inicio
         tiempo_restante = tiempo_transcurrido * (total_lotes - (i + 1))
@@ -1762,17 +1884,15 @@ def main() -> str:
             f"🔄 Repetición {intento + 1}/2 para SIMs sin número: {list(sim_sin_numero)}",
         )
 
-        puertos_fallidos = list(sim_sin_numero)
+        puertos_fallidos = filtrar_muertos(list(sim_sin_numero))
         sim_sin_numero.clear()
 
-        hilos = [
-            threading.Thread(target=procesar_puerto, args=(puerto,))
-            for puerto in puertos_fallidos
-        ]
-        for hilo in hilos:
-            hilo.start()
-        for hilo in hilos:
-            hilo.join()
+        correr_en_hilos(
+            procesar_puerto,
+            puertos_fallidos,
+            DEADLINE_ACTIVACION,
+            f"repetición {intento + 1}/2",
+        )
 
     escribir_log(LOG_COMPLETO, "📊 Resumen de activaciones:")
     escribir_log(LOG_COMPLETO, f"Claro: {activaciones_claro}/{total_claro}")
