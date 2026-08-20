@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -87,6 +87,10 @@ LOG_FALLOS = "fallos_activacion.txt"
 LOG_FALLOS_NUMERO = "fallos_sin_numero.txt"
 LOG_RESTAURACION = "log_restauracion.txt"
 LOG_TRIAGE = "log_triage.txt"
+# Corpus histórico de links de activación. A diferencia del resto, este NO se
+# trunca: sirve para buscarle el patrón al token opaco, y para eso hace falta
+# acumular casos entre corridas (y entre reinicios del autoupdate).
+LOG_LINKS_CLARO = "log_links_claro.txt"
 
 # Inicializar logs vacíos al arranque
 for log in [LOG_COMPLETO, LOG_SMS, LOG_FALLOS, LOG_RESTAURACION, LOG_TRIAGE]:
@@ -614,20 +618,173 @@ COMANDOS_MEMORIAS = ["SM", "ME", "MT"]  # zonas clásicas de la SIM
 # -----------------------
 # 🔎 Helpers extra para el modo PDU
 # -----------------------
-def extraer_numero_desde_contenido(texto: str) -> str | None:
+# ============================
+# 🔗 Links de activación Claro (fif.clarovtrcloud.com)
+# ============================
+# El SMS de bienvenida trae un link `.../aod/form?t=<token>`. Casi siempre ese
+# token ES el MSISDN sin el 56 (946844395 → 56946844395), pero NO siempre: se
+# ven links con un token opaco más un parámetro extra `tweak`
+# (?t=630066148&tweak=4756fa4772) donde el token no es el número — 630066148
+# empieza con 6 y ningún móvil chileno lo hace.
+#
+# El código viejo agarraba los últimos 8 dígitos de CUALQUIER corrida de 9 y le
+# pegaba "569" adelante, así que ese token se guardaba como 56930066148: un
+# número inventado que terminaba escrito en la agenda de la SIM y en Postgres
+# sin que nadie se enterara — y la agenda de la SIM es lo que lee HeroSMS, o sea
+# el chip quedaba publicado con un número que no es el suyo.
+#
+# Ahora el token se acepta SOLO si tiene forma de móvil chileno. Si es opaco no
+# se asigna nada (el puerto cae a `sim_sin_numero` y se reintenta como cualquier
+# otra falla) y el link crudo queda en LOG_LINKS_CLARO para buscarle el patrón.
+
+RE_LINK_CLARO = re.compile(
+    r"https?://fif\.clarovtrcloud\.com/aod/form\?\S+", re.IGNORECASE
+)
+
+# Patrones de número en texto plano. Cada uno captura el número COMPLETO
+# (con el 56/+56 si viene), no un pedazo: reconstruir pegando "569" a los
+# últimos 8 dígitos es justamente lo que fabricaba números falsos.
+PATRONES_NUMERO_TEXTO = [
+    r"tu\s*n[uú]mero\s*(?:asignado\s*)?es\s*:?\s*((?:\+ ?)?(?:56 ?)?9(?:[ -]?\d){8})",
+    r"((?:\+ ?)?56 ?9(?:[ -]?\d){8})",
+    r"\b(9(?:[ -]?\d){8})\b",
+]
+
+# Líneas de protocolo AT dentro de la salida de `AT+CMGL`. Hay que sacarlas
+# antes de buscar números: el encabezado `+CMGL: 1,"REC UNREAD","+56979171102"`
+# trae el REMITENTE, y un remitente móvil pasaba por número del chip.
+RE_LINEA_AT = re.compile(r"^(?:AT[+&]|\+[A-Za-z]{2,}:)")
+
+_links_lock = threading.Lock()
+links_opacos: list[dict] = []
+
+
+def _solo_cuerpos_sms(texto: str) -> str:
+    """Deja solo el cuerpo de los SMS: descarta ecos AT, encabezados y OK/ERROR."""
+    utiles = []
+    for linea in (texto or "").splitlines():
+        limpia = linea.strip()
+        if not limpia or limpia in ("OK", "ERROR") or RE_LINEA_AT.match(limpia):
+            continue
+        utiles.append(limpia)
+    return "\n".join(utiles)
+
+
+def normalizar_msisdn(bruto: str | None) -> str | None:
+    """Devuelve '569XXXXXXXX' si `bruto` es un móvil chileno; si no, None."""
+    digitos = re.sub(r"\D", "", bruto or "")
+    if len(digitos) == 11 and digitos.startswith("569"):
+        return digitos
+    if len(digitos) == 9 and digitos.startswith("9"):
+        return "56" + digitos
+    return None
+
+
+def _param_url(url: str, nombre: str) -> str:
+    """Saca un parámetro del query string sin depender de urllib."""
+    m = re.search(r"[?&]" + re.escape(nombre) + r"=([^&\s]*)", url, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def registrar_link_claro(
+    puerto: str, iccid: str | None, clase: str, token: str, tweak: str, numero, url: str
+):
+    """Deja el link crudo en LOG_LINKS_CLARO (TSV, append-only)."""
+    fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    linea = "\t".join(
+        [
+            fecha,
+            puerto or "?",
+            iccid or "?",
+            clase,
+            token or "-",
+            tweak or "-",
+            numero or "-",
+            url,
+        ]
+    )
+    with _links_lock:
+        nuevo = not os.path.exists(LOG_LINKS_CLARO)
+        try:
+            with open(LOG_LINKS_CLARO, "a", encoding="utf-8", newline="\n") as f:
+                if nuevo:
+                    f.write(
+                        "# fecha\tpuerto\ticcid\tclase\tt\ttweak\tnumero_asignado\turl\n"
+                    )
+                f.write(linea + "\n")
+        except Exception as e:
+            print(f"⚠️ No se pudo escribir {LOG_LINKS_CLARO}: {e}")
+
+
+def analizar_links_claro(
+    texto: str, puerto: str = "?", iccid: str | None = None
+) -> str | None:
+    """
+    Registra todos los links de activación del SMS y devuelve el número SOLO si
+    el token `t` tiene forma de móvil chileno. Token opaco → None: preferimos
+    quedarnos sin número antes que inventar uno.
+    """
+    numero = None
+    for cruda in RE_LINK_CLARO.findall(texto or ""):
+        url = cruda.rstrip(".,;")
+        token = _param_url(url, "t")
+        tweak = _param_url(url, "tweak")
+        candidato = normalizar_msisdn(token)
+        clase = "MSISDN" if candidato else "OPACO"
+        registrar_link_claro(puerto, iccid, clase, token, tweak, candidato, url)
+
+        if candidato:
+            if numero is None:
+                numero = candidato
+        else:
+            with _links_lock:
+                links_opacos.append(
+                    {"puerto": puerto, "iccid": iccid, "t": token, "tweak": tweak}
+                )
+            aviso = (
+                f"🔗 [{puerto}] Link con token opaco (t={token or '-'}, "
+                f"tweak={tweak or '-'}): NO se asigna número. "
+                f"Guardado en {LOG_LINKS_CLARO}."
+            )
+            console.print(f"[yellow]{aviso}[/yellow]")
+            escribir_log(LOG_COMPLETO, aviso)
+    return numero
+
+
+def resumen_links_claro():
+    """Una línea al cierre: cuántos chips quedaron colgados por token opaco."""
+    if not links_opacos:
+        return
+    puertos = ", ".join(sorted({d["puerto"] for d in links_opacos}))
+    mensaje = (
+        f"🔗 {len(links_opacos)} link(s) con token opaco en esta corrida "
+        f"({puertos}). Esos chips NO recibieron número: el detalle está en "
+        f"{LOG_LINKS_CLARO}."
+    )
+    print(mensaje)
+    escribir_log(LOG_COMPLETO, mensaje)
+
+
+def extraer_numero_desde_contenido(
+    texto: str, puerto: str = "?", iccid: str | None = None
+) -> str | None:
     """
     Intenta encontrar un número chileno en el cuerpo de un SMS.
     Devuelve '569XXXXXXXX' o None.
     """
-    patrones = [
-        r"\b(?:\+?56)?9(\d{8})\b",  # +569XXXXXXXX o 569XXXXXXXX o 9XXXXXXXX
-        r"tu\s*n[uú]mero\s*es\s*(\d{9})",  # frases tipo 'Tu numero es 912345678'
-    ]
-    for patron in patrones:
-        m = re.search(patron, texto, re.IGNORECASE)
-        if m:
-            return f"569{m.group(1)[-8:]}"
-    return None
+    # Los links se analizan aparte y después se BORRAN del texto: si no, el
+    # patrón genérico de 9 dígitos se come el token de la URL y lo pasa por
+    # número.
+    numero_link = analizar_links_claro(texto, puerto, iccid)
+    limpio = _solo_cuerpos_sms(RE_LINK_CLARO.sub(" ", texto or ""))
+
+    for patron in PATRONES_NUMERO_TEXTO:
+        for m in re.finditer(patron, limpio, re.IGNORECASE):
+            numero = normalizar_msisdn(m.group(1))
+            if numero:
+                return numero
+
+    return numero_link
 
 
 def guardar_numero_en_sim(puerto: str, numero: str) -> bool:
@@ -655,7 +812,7 @@ def borrar_mensaje(puerto: str, indice: str, origen: str):
 # -----------------------
 # 💬  Lector SMS en modo PDU
 # -----------------------
-def leer_sms_modo_pdu(puerto: str, stats: dict):
+def leer_sms_modo_pdu(puerto: str, stats: dict, iccid: str | None = None):
     """
     Lee, decodifica y procesa SMS en modo PDU (AT+CMGF=0) para todas las
     memorias declaradas en COMANDOS_MEMORIAS.  Usa `stats` para ir
@@ -687,7 +844,7 @@ def leer_sms_modo_pdu(puerto: str, stats: dict):
             try:
                 sms = read_incoming_sms(pdu)
                 contenido = sms.get("content", "")
-                numero = extraer_numero_desde_contenido(contenido)
+                numero = extraer_numero_desde_contenido(contenido, puerto, iccid)
 
                 if numero:
                     console.print(
@@ -1051,16 +1208,6 @@ def leer_sms(puerto, iccid):
     memorias = ["SM", "ME", "MT"]
     numero = None
 
-    patrones_numeros = [
-        r"Tu numero es (\d+)",
-        r"\b(\d{9})\b",
-        r"\+569 ?(\d{4} ?\d{4})",
-        r"569 ?(\d{4} ?\d{4})",
-        r"\+569(\d{8})",
-        r"569(\d{8})",
-        r"\b(?:tu\s*n[uú]mero\s*es)\s*([\d\s]+)",
-    ]
-
     for memoria in memorias:
         enviar_comando(puerto, f'AT+CPMS="{memoria}"')
         respuesta = enviar_comando(puerto, 'AT+CMGL="ALL"', espera=2)
@@ -1068,22 +1215,11 @@ def leer_sms(puerto, iccid):
             LOG_SMS, f"[{puerto}] SMS recibido de memoria {memoria}:\n{respuesta}"
         )
 
+        # Mismo extractor que el camino PDU: valida forma de móvil chileno y
+        # registra los links de activación en LOG_LINKS_CLARO.
         if operador == "Claro":
-            for patron in patrones_numeros:
-                match = re.search(patron, respuesta, re.IGNORECASE)
-                if match:
-                    numero_extraido = match.group(1).replace(" ", "")
-                    numero = f"569{numero_extraido[-8:]}"  # Asegura formato 569XXXXXXXX
-                    break
+            numero = extraer_numero_desde_contenido(respuesta, puerto, iccid)
             if numero:
-                break
-
-        if operador == "Claro" and not numero:
-            match_url = re.search(
-                r"https://fif\.clarovtrcloud\.com/aod/form\?t=(\d+)", respuesta
-            )
-            if match_url:
-                numero = f"569{match_url.group(1)[-8:]}"
                 break
 
     if numero:
@@ -1748,7 +1884,7 @@ def _procesar_puerto(puerto: str):
             numero_obtenido = leer_sms(puerto, iccid)
             if not numero_obtenido:
                 stats = {"leidos": 0, "procesados": 0, "ignorados": 0}
-                numero_obtenido = leer_sms_modo_pdu(puerto, stats)
+                numero_obtenido = leer_sms_modo_pdu(puerto, stats, iccid)
 
             if numero_obtenido:
                 guardar_resultado(iccid, numero_obtenido, puerto)
@@ -1951,6 +2087,7 @@ def evaluar_flota(reiniciar_modems: bool = False) -> tuple[str, str]:
 
 def cerrar_corrida(abrir_herosms: bool):
     """Cierre común: deja el listado sincronizado y decide si devolver los módems."""
+    resumen_links_claro()
     exportar_base_datos_completa()
     limpiar_listado()
 
