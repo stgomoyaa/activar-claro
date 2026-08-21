@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.6.0"
+VERSION = "3.7.0"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -621,11 +621,10 @@ COMANDOS_MEMORIAS = ["SM", "ME", "MT"]  # zonas clásicas de la SIM
 # ============================
 # 🔗 Links de activación Claro (fif.clarovtrcloud.com)
 # ============================
-# El SMS de bienvenida trae un link `.../aod/form?t=<token>`. Casi siempre ese
-# token ES el MSISDN sin el 56 (946844395 → 56946844395), pero NO siempre: se
-# ven links con un token opaco más un parámetro extra `tweak`
-# (?t=630066148&tweak=4756fa4772) donde el token no es el número — 630066148
-# empieza con 6 y ningún móvil chileno lo hace.
+# El SMS de bienvenida trae un link `.../aod/form?t=<token>`. Cuando el link
+# viene SOLO (sin más parámetros) ese token ES el MSISDN sin el 56
+# (946844395 → 56946844395). Cuando trae además `tweak` (?t=630066148&
+# tweak=4756fa4772) el token NO es el número: es un valor cifrado.
 #
 # El código viejo agarraba los últimos 8 dígitos de CUALQUIER corrida de 9 y le
 # pegaba "569" adelante, así que ese token se guardaba como 56930066148: un
@@ -633,9 +632,26 @@ COMANDOS_MEMORIAS = ["SM", "ME", "MT"]  # zonas clásicas de la SIM
 # sin que nadie se enterara — y la agenda de la SIM es lo que lee HeroSMS, o sea
 # el chip quedaba publicado con un número que no es el suyo.
 #
-# Ahora el token se acepta SOLO si tiene forma de móvil chileno. Si es opaco no
-# se asigna nada (el puerto cae a `sim_sin_numero` y se reintenta como cualquier
-# otra falla) y el link crudo queda en LOG_LINKS_CLARO para buscarle el patrón.
+# 3.6.0 arregló la reconstrucción pero seguía clasificando por forma: si el
+# token cifrado empezaba en 9 pasaba por móvil chileno igual. Como el token es
+# uniforme sobre 000000000-999999999, eso ocurre ~10% de las veces — medido en
+# la corrida del 2026-08-20: 19 de 115 links con tweak (17%) y 17 chips con
+# número falso escrito en la SIM y en Postgres.
+#
+# 3.7.0: si el link trae `tweak`, el token NUNCA se acepta como número, empiece
+# como empiece. La regla es segura — sobre 113 pares (token con tweak, número
+# real del mismo ICCID) sacados de log_links_claro.txt no hubo ni una sola
+# coincidencia, y ninguna relación derivable entre el token y el número
+# (afín mod 1e9, XOR-lineal, dígito a dígito, permutación, orden, residuos:
+# todo dentro del ruido). El nombre del parámetro es la pista: `tweak` es el
+# término de NIST FF1/FF3-1, cifrado que preserva formato — 9 dígitos entran,
+# 9 dígitos salen, y hace falta la llave de Claro para invertirlo. Juntar más
+# casos no sirve: no es un patrón, es criptografía.
+#
+# El chip cae a `sim_sin_numero` y se reintenta como cualquier otra falla; en
+# la práctica el link plano con el número real llega en un reintento posterior
+# (pasó en 15 de los 17 chips afectados de esa misma corrida). El link crudo
+# queda en LOG_LINKS_CLARO igual, por si algún día aparece el patrón.
 
 RE_LINK_CLARO = re.compile(
     r"https?://fif\.clarovtrcloud\.com/aod/form\?\S+", re.IGNORECASE
@@ -721,15 +737,18 @@ def analizar_links_claro(
 ) -> str | None:
     """
     Registra todos los links de activación del SMS y devuelve el número SOLO si
-    el token `t` tiene forma de móvil chileno. Token opaco → None: preferimos
-    quedarnos sin número antes que inventar uno.
+    el link viene sin `tweak` Y el token `t` tiene forma de móvil chileno.
+    Cualquier link con `tweak` es opaco por definición: su token está cifrado y
+    da igual que empiece en 9. Preferimos quedarnos sin número antes que
+    inventar uno.
     """
     numero = None
     for cruda in RE_LINK_CLARO.findall(texto or ""):
         url = cruda.rstrip(".,;")
         token = _param_url(url, "t")
         tweak = _param_url(url, "tweak")
-        candidato = normalizar_msisdn(token)
+        # El `tweak` manda sobre la forma del token: con tweak nunca es MSISDN.
+        candidato = None if tweak else normalizar_msisdn(token)
         clase = "MSISDN" if candidato else "OPACO"
         registrar_link_claro(puerto, iccid, clase, token, tweak, candidato, url)
 
@@ -741,8 +760,13 @@ def analizar_links_claro(
                 links_opacos.append(
                     {"puerto": puerto, "iccid": iccid, "t": token, "tweak": tweak}
                 )
+            motivo = (
+                "link con tweak (token cifrado)"
+                if tweak
+                else "token sin forma de móvil chileno"
+            )
             aviso = (
-                f"🔗 [{puerto}] Link con token opaco (t={token or '-'}, "
+                f"🔗 [{puerto}] {motivo} (t={token or '-'}, "
                 f"tweak={tweak or '-'}): NO se asigna número. "
                 f"Guardado en {LOG_LINKS_CLARO}."
             )
@@ -1461,6 +1485,72 @@ def buscar_numero(iccid: str, indice: dict[str, str]) -> str | None:
 
 
 # ============================
+# 🧹 Números falsos escritos por versiones < 3.7.0
+# ============================
+# Hasta 3.6.0 un link con `tweak` cuyo token cifrado empezaba en 9 pasaba por
+# móvil chileno y terminaba escrito en la agenda de la SIM — que es lo que lee
+# HeroSMS. Corregir Postgres no alcanza: la Fase 0 solo reescribe agendas
+# VACÍAS, y estas tienen un número (falso) adentro, así que nunca se tocarían.
+#
+# LOG_LINKS_CLARO es append-only y guarda el token crudo de cada link con su
+# ICCID, o sea la evidencia de qué número falso pudo escribirse en cada chip.
+# Con eso se reescribe SOLO donde hay prueba: agenda ≠ DB **y** el número de la
+# agenda es exactamente un token cifrado de ese mismo ICCID. Cualquier otra
+# discrepancia se deja quieta — la SIM puede tener razón y la DB estar vieja.
+
+_falsos_lock = threading.Lock()
+_falsos_cache: dict[str, set[str]] | None = None
+
+
+def numeros_falsos_por_iccid() -> dict[str, set[str]]:
+    """
+    {iccid: {'569XXXXXXXX', ...}} con los números que una versión < 3.7.0 pudo
+    haber fabricado a partir de un link con `tweak`, según LOG_LINKS_CLARO.
+    """
+    global _falsos_cache
+    with _falsos_lock:
+        if _falsos_cache is not None:
+            return _falsos_cache
+
+        mapa: dict[str, set[str]] = {}
+        try:
+            with open(LOG_LINKS_CLARO, "r", encoding="utf-8") as f:
+                for linea in f:
+                    if linea.startswith("#") or not linea.strip():
+                        continue
+                    campos = linea.rstrip("\n").split("\t")
+                    if len(campos) < 6:
+                        continue
+                    iccid, token, tweak = campos[2], campos[4], campos[5]
+                    if not tweak or tweak == "-":
+                        continue  # link plano: su token sí es el número
+                    falso = normalizar_msisdn(token)
+                    if not falso:
+                        continue  # token que ni siquiera parecía móvil: nunca se escribió
+                    mapa.setdefault(_normalizar_iccid(iccid), set()).add(falso)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            escribir_log(LOG_RESTAURACION, f"⚠️ No se pudo leer {LOG_LINKS_CLARO}: {e}")
+
+        _falsos_cache = mapa
+        return mapa
+
+
+def buscar_falsos(iccid: str, mapa: dict[str, set[str]]) -> set[str]:
+    """Como buscar_numero(), tolerando el dígito de control final del ICCID."""
+    iccid = _normalizar_iccid(iccid)
+    if not iccid:
+        return set()
+    if iccid in mapa:
+        return mapa[iccid]
+    for clave, falsos in mapa.items():
+        if clave.startswith(iccid) or iccid.startswith(clave):
+            return falsos
+    return set()
+
+
+# ============================
 # 🚦 Lectura de estado de la flota
 # ============================
 # "Tarjeta lista" = tiene el contacto 'myphone' con un móvil chileno en la
@@ -1726,6 +1816,66 @@ def restaurar_numero_en_sim(puerto: str, numero: str) -> bool:
     return bool(verificado) and verificado[-8:] == numero[-8:]
 
 
+def _corregir_numero_falso(
+    puerto: str,
+    iccid: str,
+    numero_actual: str,
+    indice: dict[str, str],
+    desde_db: bool,
+    registro: dict,
+) -> str | None:
+    """
+    Reescribe la agenda cuando tiene un número que fabricó una versión < 3.7.0.
+
+    Solo actúa con prueba doble: la DB (source of truth, y solo si respondió)
+    dice otro número Y el que está en la agenda es exactamente un token cifrado
+    registrado para ESE ICCID. Devuelve el número corregido, o None si no había
+    nada que corregir.
+    """
+    if not desde_db:
+        return None  # sin DB viva no se pisa una agenda que ya tiene número
+
+    numero_db = buscar_numero(iccid, indice)
+    if not numero_db or numero_db == numero_actual:
+        return None
+
+    if numero_actual not in buscar_falsos(iccid, numeros_falsos_por_iccid()):
+        # Discrepancia sin evidencia de token cifrado: puede ser la DB la que
+        # está vieja. No se toca, pero queda anotado.
+        escribir_log(
+            LOG_RESTAURACION,
+            f"ℹ️ [{puerto}] La agenda dice {numero_actual} y la DB {numero_db}. "
+            "Sin rastro de token cifrado para este ICCID: no se toca.",
+        )
+        return None
+
+    escribir_log(
+        LOG_RESTAURACION,
+        f"🧹 [{puerto}] La agenda tiene {numero_actual}, que es un token cifrado "
+        f"de un link con tweak. Corrigiendo a {numero_db} (DB)...",
+    )
+    if restaurar_numero_en_sim(puerto, numero_db):
+        registro["restaurado"] = True
+        registro["fuente"] = "db"
+        registro["detalle"] = f"número falso {numero_actual} corregido a {numero_db}"
+        escribir_log(
+            LOG_RESTAURACION,
+            f"✅ [{puerto}] Corregido: {numero_actual} → {numero_db}.",
+        )
+        with restauracion_lock:
+            restauraciones_ok.append(f"{puerto}={numero_db} (corregido)")
+        return numero_db
+
+    registro["detalle"] = f"falló corregir {numero_actual} → {numero_db}"
+    escribir_log(
+        LOG_RESTAURACION,
+        f"❌ [{puerto}] No se pudo corregir {numero_actual} → {numero_db}.",
+    )
+    with restauracion_lock:
+        restauraciones_fallidas.append(f"{puerto}={numero_db} (corrección)")
+    return None
+
+
 def restaurar_puerto(
     puerto: str, indice: dict[str, str], inventario: dict, desde_db: bool = True
 ):
@@ -1753,12 +1903,16 @@ def restaurar_puerto(
 
             numero_actual, detalle = leer_myphone(puerto)
             if numero_actual:
-                registro["numero"] = numero_actual
-                registro["detalle"] = detalle
-                escribir_log(
-                    LOG_RESTAURACION,
-                    f"✅ [{puerto}] La agenda ya tiene {numero_actual}: nada que recuperar.",
+                correcto = _corregir_numero_falso(
+                    puerto, iccid, numero_actual, indice, desde_db, registro
                 )
+                registro["numero"] = correcto or numero_actual
+                if not correcto:
+                    registro["detalle"] = detalle
+                    escribir_log(
+                        LOG_RESTAURACION,
+                        f"✅ [{puerto}] La agenda ya tiene {numero_actual}: nada que recuperar.",
+                    )
                 return
 
             numero = buscar_numero(iccid, indice)
@@ -1802,7 +1956,8 @@ def restaurar_puerto(
 
 def fase_restauracion(modems_activos: list) -> dict:
     """
-    Reescribe en la agenda de cada SIM el número que HeroSMS borró.
+    Reescribe en la agenda de cada SIM el número que HeroSMS borró, y de paso
+    corrige las agendas que quedaron con un número falso de una versión < 3.7.0.
 
     Devuelve el inventario {puerto: registro} con el estado en que quedó cada
     módem. Los puertos recuperados salen marcados con restaurado=True.
