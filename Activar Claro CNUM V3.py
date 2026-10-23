@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "3.7.0"
+VERSION = "3.8.0"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import serial
@@ -335,6 +335,7 @@ def correr_en_hilos(
 # ============================
 
 import urllib.request
+import urllib.error
 import json
 import shutil
 from datetime import datetime
@@ -702,6 +703,99 @@ def _param_url(url: str, nombre: str) -> str:
     return m.group(1) if m else ""
 
 
+# ============================
+# 🔓 3.8.0 — Descifrado del token con `tweak` (API del form AOD)
+# ============================
+# Desde el 2026-10-22 Claro manda TODOS los links de activación con `tweak`
+# (token FF1 cifrado): 0/11891 links limpios ese día, así que la regla de
+# 3.7.0 ("esperar el link plano en un reintento") dejó de funcionar.
+# El propio form web (fif.clarovtrcloud.com/aod/form, Next.js) descifra el
+# token llamando a su API (visible en el JS del form, chunk
+# 633-950f269c4e0e5b7e.js):
+#   POST https://api-faceid.clarovtrcloud.com/ivs/api/v1/decryption
+#   body {"encryptText": <t>, "encryptWeak": <tweak>}  ->  {"plainText": "9XXXXXXXX"}
+# plainText ES el MSISDN sin el 56. Validado contra 62 pares históricos
+# (ICCID con link limpio + link opaco del mismo chip): 62/62 coinciden con el
+# número real, y en 5 tarjetas de fallo del 2026-10-22 el número extraído se
+# reprodujo en 2 lecturas frescas de la SIM.
+# Si la API falla (credenciales rotadas, WAF), se cae al comportamiento 3.7.0:
+# link opaco, chip a sin_numero, reintento después. Nunca se inventa número.
+
+API_DESCIFRADO_URL = "https://api-faceid.clarovtrcloud.com/ivs/api/v1/decryption"
+# Basic "admin:<clave del JS del form>" — rotarla mirando el chunk del form.
+API_DESCIFRADO_AUTH = "Basic YWRtaW46WjN0QFY5d2I4cUxwTjFDSw=="
+
+_descifrado_lock = threading.Lock()
+_descifrado_ts = [0.0]  # instante de la última llamada (throttle global)
+_descifrado_cache: dict[tuple[str, str], str | None] = {}
+
+
+def descifrar_token_claro(token: str, tweak: str) -> str | None:
+    """
+    Descifra el token `t` usando el `tweak` vía la API del form AOD.
+    Devuelve '9XXXXXXXX' o None. Con caché por (token, tweak) — el mismo
+    link llega decenas de veces por chip — y throttle global de 1.2 s:
+    en ráfaga el WAF de Claro responde 403 Forbidden.
+    """
+    clave = (token, tweak)
+    with _descifrado_lock:
+        if clave in _descifrado_cache:
+            return _descifrado_cache[clave]
+
+    body = json.dumps({"encryptText": token, "encryptWeak": tweak}).encode()
+    for intento in range(4):
+        with _descifrado_lock:
+            # Throttle global: mínimo 1.2 s entre llamadas a la API.
+            espera = 1.2 - (time.time() - _descifrado_ts[0])
+            if espera > 0:
+                time.sleep(espera)
+            _descifrado_ts[0] = time.time()
+        req = urllib.request.Request(
+            API_DESCIFRADO_URL,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": API_DESCIFRADO_AUTH,
+                "Origin": "https://fif.clarovtrcloud.com",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                plano = json.loads(r.read().decode()).get("plainText", "")
+            with _descifrado_lock:
+                _descifrado_cache[clave] = plano or None
+            return plano or None
+        except urllib.error.HTTPError as e:
+            # 400 = token/tweak inválido (no tiene sentido reintentar).
+            if e.code == 400:
+                escribir_log(LOG_COMPLETO, f"🔓 Descifrado AOD: token inválido (t={token}).")
+                with _descifrado_lock:
+                    _descifrado_cache[clave] = None
+                return None
+            # 403/429/5xx: backoff y reintento; al 4º fallo, rendirse.
+            if intento == 3:
+                escribir_log(
+                    LOG_COMPLETO,
+                    f"🔓 Descifrado AOD falló tras reintentos (t={token}): {e}",
+                )
+                return None
+            time.sleep(2 * (intento + 1))
+        except Exception as e:
+            if intento == 3:
+                escribir_log(
+                    LOG_COMPLETO,
+                    f"🔓 Descifrado AOD falló tras reintentos (t={token}): {e}",
+                )
+                return None
+            time.sleep(2 * (intento + 1))
+    return None
+
+
 def registrar_link_claro(
     puerto: str, iccid: str | None, clase: str, token: str, tweak: str, numero, url: str
 ):
@@ -747,8 +841,23 @@ def analizar_links_claro(
         url = cruda.rstrip(".,;")
         token = _param_url(url, "t")
         tweak = _param_url(url, "tweak")
-        # El `tweak` manda sobre la forma del token: con tweak nunca es MSISDN.
+        # El `tweak` manda sobre la forma del token: con tweak nunca es MSISDN…
         candidato = None if tweak else normalizar_msisdn(token)
+        # …pero desde 3.8.0 se DESCIFRA el token vía la API del form AOD.
+        # Solo se acepta si el descifrado devuelve un móvil chileno válido;
+        # si falla, se cae al comportamiento 3.7.0 (opaco + reintento).
+        if candidato is None and tweak:
+            plano = descifrar_token_claro(token, tweak)
+            if plano:
+                candidato = normalizar_msisdn(plano)
+                if candidato:
+                    aviso = (
+                        f"🔓 [{puerto}] Token con tweak descifrado vía API AOD "
+                        f"(t={token}): número {candidato[:4]}••••••{candidato[-2:]}"
+                        " recuperado."
+                    )
+                    console.print(f"[green]{aviso}[/green]")
+                    escribir_log(LOG_COMPLETO, aviso)
         clase = "MSISDN" if candidato else "OPACO"
         registrar_link_claro(puerto, iccid, clase, token, tweak, candidato, url)
 
