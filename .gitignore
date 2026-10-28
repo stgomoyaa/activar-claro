@@ -23,3 +23,6 @@ __pycache__/
 *.lnk
 *.ink
 *.bat
+
+# Credencial local del proxy de descifrado
+proxy_claro.txt

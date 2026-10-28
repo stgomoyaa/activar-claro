@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import time
@@ -37,6 +37,7 @@ import zlib
 import atexit
 import ctypes
 import tempfile
+import statistics
 from functools import lru_cache
 
 
@@ -401,6 +402,7 @@ DEADLINE_VALIDACION = 60  # AT + espera de 1s, sano ≈ 2s
 DEADLINE_LECTURA = 240  # ICCID (hasta 30s) + agenda, sano ≈ 40s
 DEADLINE_BORRADO = 180  # AT+CMGD por puerto
 DEADLINE_ACTIVACION = 600  # 3 intentos de USSD + SMS, sano ≈ 150s
+DEADLINE_DIFERIDO = 600  # hasta 3 descifrados con reintentos de red
 
 
 def marcar_puerto_muerto(puerto: str, etapa: str):
@@ -493,7 +495,7 @@ def correr_en_hilos(
 import urllib.request
 import urllib.error
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 import ssl
 
 
@@ -890,11 +892,73 @@ API_DESCIFRADO_AUTH = "Basic YWRtaW46WjN0QFY5d2I4cUxwTjFDSw=="
 
 _descifrado_lock = threading.Lock()
 _descifrado_ts = [0.0]  # instante de la última llamada (throttle global)
+_descifrado_despertar = threading.Event()
 _descifrado_cache: dict[tuple[str, str], str | None] = {}
 _descifrado_contexto_ok = 0
 _descifrado_contextos_logueados = set()
+DESCIFRADO_ENFRIAMIENTO_S = 600
+_reloj_descifrado = time.monotonic
+_descifrado_corte_abierto = False
+_descifrado_bloqueado_hasta = 0.0
+_descifrado_sonda_en_curso = False
+_descifrado_corte_epoch = 0
+_proxy_claro_leido = False
+_proxy_claro_config = None
+_proxy_claro_caido = False
+_proxy_claro_evento_emitido = False
 
 
+def _leer_proxy_claro():
+    """Carga la configuración opcional sin propagar ni registrar credenciales."""
+    global _proxy_claro_leido, _proxy_claro_config
+    if _proxy_claro_leido:
+        return _proxy_claro_config
+    _proxy_claro_leido = True
+    try:
+        from urllib.parse import quote
+
+        ruta = Path(__file__).resolve().with_name("proxy_claro.txt")
+        if not ruta.exists():
+            return None
+        lineas = ruta.read_text(encoding="utf-8-sig").splitlines()
+        linea = next(
+            (x.strip() for x in lineas if x.strip() and not x.lstrip().startswith("#")),
+            "",
+        )
+        if not linea or "@" not in linea:
+            return None
+        auth, host_puerto = linea.rsplit("@", 1)
+        usuario, separador, clave = auth.partition(":")
+        host, separador_host, puerto = host_puerto.rpartition(":")
+        if not separador or not separador_host or not usuario or not clave or not host or not puerto:
+            return None
+        proxy = f"http://{quote(usuario, safe='')}:{quote(clave, safe='')}@{host}:{puerto}"
+        _proxy_claro_config = {
+            "proxy": proxy,
+            "secretos": (linea, auth),
+        }
+    except Exception:
+        _proxy_claro_config = None
+    return _proxy_claro_config
+
+
+def _marcar_proxy_claro_caido(causa):
+    global _proxy_claro_caido, _proxy_claro_evento_emitido
+    with _descifrado_lock:
+        _proxy_claro_caido = True
+        emitir = not _proxy_claro_evento_emitido
+        _proxy_claro_evento_emitido = True
+    if not emitir:
+        return
+    causa_segura = causa if causa in {"credencial", "sin saldo"} else "inalcanzable"
+    emitir_evento(
+        "AVISO",
+        None,
+        None,
+        "descifrado",
+        f"El proxy de descifrado falló ({causa_segura}); se consulta directo.",
+        codigo="DESCIFRADO_PROXY_ERROR",
+    )
 def _contextos_ssl_descifrado():
     """Orden: trust del sistema, certifi y último recurso sin validar."""
     contextos = [("sistema", None)]
@@ -930,90 +994,278 @@ def descifrar_token_claro(token: str, tweak: str) -> str | None:
     en ráfaga el WAF de Claro responde 403 Forbidden.
     """
     clave = (token, tweak)
+    global _descifrado_contexto_ok
+    global _descifrado_corte_abierto, _descifrado_bloqueado_hasta
+    global _descifrado_sonda_en_curso
+    global _descifrado_corte_epoch
+    global _descifrado_bloqueado_hasta
+    es_sonda = False
     with _descifrado_lock:
         if clave in _descifrado_cache:
             return _descifrado_cache[clave]
+        if _descifrado_corte_abierto:
+            ahora = _reloj_descifrado()
+            if ahora < _descifrado_bloqueado_hasta or _descifrado_sonda_en_curso:
+                return None
+            _descifrado_sonda_en_curso = True
+            es_sonda = True
+
+    def registrar_bloqueo():
+        global _descifrado_corte_abierto, _descifrado_bloqueado_hasta
+        global _descifrado_sonda_en_curso
+        global _descifrado_corte_epoch
+        with _descifrado_lock:
+            nueva_apertura = not _descifrado_corte_abierto or es_sonda
+            _descifrado_corte_abierto = True
+            _descifrado_bloqueado_hasta = (
+                _reloj_descifrado() + DESCIFRADO_ENFRIAMIENTO_S
+            )
+            _descifrado_sonda_en_curso = False
+            _descifrado_corte_epoch += 1
+            _descifrado_ts[0] = time.monotonic()
+            _descifrado_despertar.set()
+            proxima = datetime.fromtimestamp(
+                time.time() + DESCIFRADO_ENFRIAMIENTO_S
+            ).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        if nueva_apertura:
+            emitir_evento(
+                "AVISO",
+                None,
+                None,
+                "descifrado",
+                f"Claro bloqueó la API de descifrado (403/429); próxima sonda: {proxima}.",
+                codigo="DESCIFRADO_BLOQUEADO",
+            )
 
     body = json.dumps({"encryptText": token, "encryptWeak": tweak}).encode()
-    global _descifrado_contexto_ok
-    for intento in range(4):
-        with _descifrado_lock:
-            # Throttle global: mínimo 1.2 s entre llamadas a la API.
-            espera = 1.2 - (time.time() - _descifrado_ts[0])
-            if espera > 0:
-                time.sleep(espera)
-            _descifrado_ts[0] = time.time()
-        req = urllib.request.Request(
-            API_DESCIFRADO_URL,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": API_DESCIFRADO_AUTH,
-                "Origin": "https://fif.clarovtrcloud.com",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-                ),
-            },
-        )
-        try:
-            contextos = _contextos_ssl_descifrado()
-            with _descifrado_lock:
-                inicio_contexto = min(_descifrado_contexto_ok, len(contextos) - 1)
-            for indice in range(inicio_contexto, len(contextos)):
-                nombre_contexto, contexto = contextos[indice]
+    try:
+        proxy_config = _leer_proxy_claro() if not _proxy_claro_caido else None
+        if proxy_config:
+            bloqueos_proxy = 0
+            errores_red_proxy = 0
+            for intento_proxy in range(4):
+                with _descifrado_lock:
+                    ahora_throttle = time.monotonic()
+                    turno = max(ahora_throttle, _descifrado_ts[0] + 1.2)
+                    _descifrado_ts[0] = turno
+                    inicio_contexto = _descifrado_contexto_ok
+                    corte_epoch_inicial = _descifrado_corte_epoch
+                espera = turno - ahora_throttle
+                if espera > 0:
+                    _descifrado_despertar.wait(espera)
+                with _descifrado_lock:
+                    if not es_sonda and (
+                        _descifrado_corte_abierto
+                        or _descifrado_corte_epoch != corte_epoch_inicial
+                    ):
+                        return None
+                req_proxy = urllib.request.Request(
+                    API_DESCIFRADO_URL,
+                    data=body,
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": API_DESCIFRADO_AUTH,
+                        "Origin": "https://fif.clarovtrcloud.com",
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+                        ),
+                    },
+                )
                 try:
-                    opciones = {"timeout": 30}
-                    if contexto is not None:
-                        opciones["context"] = contexto
-                    with urllib.request.urlopen(req, **opciones) as r:
-                        plano = json.loads(r.read().decode()).get("plainText", "")
-                    with _descifrado_lock:
-                        _descifrado_contexto_ok = indice
-                        _descifrado_cache[clave] = plano or None
-                        if indice > 0 and indice not in _descifrado_contextos_logueados:
+                    contextos = _contextos_ssl_descifrado()
+                    inicio_contexto = min(inicio_contexto, len(contextos) - 1)
+                    for indice in range(inicio_contexto, len(contextos)):
+                        nombre_contexto, contexto = contextos[indice]
+                        try:
+                            proxy_handler = urllib.request.ProxyHandler(
+                                {"http": proxy_config["proxy"], "https": proxy_config["proxy"]}
+                            )
+                            https_handler = urllib.request.HTTPSHandler(context=contexto)
+                            opener = urllib.request.build_opener(proxy_handler, https_handler)
+                            with opener.open(req_proxy, timeout=30) as respuesta:
+                                plano = json.loads(respuesta.read().decode()).get("plainText", "")
+                            if es_sonda and not (isinstance(plano, str) and plano.strip()):
+                                registrar_bloqueo()
+                                return None
+                            with _descifrado_lock:
+                                _descifrado_contexto_ok = indice
+                                _descifrado_cache[clave] = plano or None
+                                if es_sonda:
+                                    _descifrado_corte_abierto = False
+                                    _descifrado_bloqueado_hasta = 0.0
+                                    _descifrado_sonda_en_curso = False
+                                    _descifrado_despertar.clear()
+                                degradado = (
+                                    indice > 0
+                                    and indice not in _descifrado_contextos_logueados
+                                )
+                                if degradado:
+                                    _descifrado_contextos_logueados.add(indice)
+                            if degradado:
+                                nivel = "certifi" if nombre_contexto == "certifi" else "sin verificación"
+                                escribir_log(LOG_COMPLETO, f"🔒 Descifrado AOD: contexto SSL degradado a {nivel}.")
+                            return plano or None
+                        except Exception as error_ssl:
+                            if _es_error_verificacion_ssl(error_ssl) and indice + 1 < len(contextos):
+                                continue
+                            raise
+                except urllib.error.HTTPError as error_proxy:
+                    if error_proxy.code in (403, 429):
+                        bloqueos_proxy += 1
+                        if intento_proxy == 3 and bloqueos_proxy == 4:
+                            registrar_bloqueo()
+                        if intento_proxy < 3:
+                            time.sleep(2 * (intento_proxy + 1))
+                        continue
+                    if error_proxy.code in (402, 407):
+                        _marcar_proxy_claro_caido(
+                            "sin saldo" if error_proxy.code == 402 else "credencial"
+                        )
+                        break
+                    if error_proxy.code == 400:
+                        with _descifrado_lock:
+                            _descifrado_cache[clave] = None
+                        return None
+                    if intento_proxy < 3:
+                        time.sleep(2 * (intento_proxy + 1))
+                    continue
+                except Exception as error_proxy:
+                    if _es_error_verificacion_ssl(error_proxy):
+                        escribir_log(LOG_COMPLETO, "🔓 Descifrado AOD: falló la verificación SSL por proxy.")
+                        return None
+                    mensaje_proxy = str(error_proxy)
+                    if "Tunnel connection failed: 407" in mensaje_proxy or " 407 " in mensaje_proxy:
+                        _marcar_proxy_claro_caido("credencial")
+                        break
+                    if "Tunnel connection failed: 402" in mensaje_proxy or " 402 " in mensaje_proxy:
+                        _marcar_proxy_claro_caido("sin saldo")
+                        break
+                    errores_red_proxy += 1
+                    if intento_proxy == 3 and errores_red_proxy == 4:
+                        _marcar_proxy_claro_caido("inalcanzable")
+                        break
+                    if intento_proxy < 3:
+                        time.sleep(2 * (intento_proxy + 1))
+            if bloqueos_proxy == 4:
+                return None
+            if not _proxy_claro_caido:
+                return None
+
+        for intento in range(4):
+            # Reserva el siguiente turno bajo el lock y espera fuera de él.
+            # Así las llamadas que encuentran el corte abierto retornan rápido.
+            with _descifrado_lock:
+                ahora_throttle = time.monotonic()
+                turno = max(ahora_throttle, _descifrado_ts[0] + 1.2)
+                _descifrado_ts[0] = turno
+                inicio_contexto = _descifrado_contexto_ok
+                corte_epoch_inicial = _descifrado_corte_epoch
+            espera = turno - ahora_throttle
+            if espera > 0:
+                _descifrado_despertar.wait(espera)
+            with _descifrado_lock:
+                if not es_sonda and (
+                    _descifrado_corte_abierto
+                    or _descifrado_corte_epoch != corte_epoch_inicial
+                ):
+                    return None
+
+            req = urllib.request.Request(
+                API_DESCIFRADO_URL,
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": API_DESCIFRADO_AUTH,
+                    "Origin": "https://fif.clarovtrcloud.com",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+                    ),
+                },
+            )
+            try:
+                contextos = _contextos_ssl_descifrado()
+                inicio_contexto = min(inicio_contexto, len(contextos) - 1)
+                for indice in range(inicio_contexto, len(contextos)):
+                    nombre_contexto, contexto = contextos[indice]
+                    try:
+                        opciones = {"timeout": 30}
+                        if contexto is not None:
+                            opciones["context"] = contexto
+                        with urllib.request.urlopen(req, **opciones) as r:
+                            plano = json.loads(r.read().decode()).get("plainText", "")
+                        if es_sonda and not (isinstance(plano, str) and plano.strip()):
+                            registrar_bloqueo()
+                            return None
+                        with _descifrado_lock:
+                            _descifrado_contexto_ok = indice
+                            _descifrado_cache[clave] = plano or None
+                            if es_sonda:
+                                _descifrado_corte_abierto = False
+                                _descifrado_bloqueado_hasta = 0.0
+                                _descifrado_sonda_en_curso = False
+                                _descifrado_despertar.clear()
+                            degradado = (
+                                indice > 0
+                                and indice not in _descifrado_contextos_logueados
+                            )
+                            if degradado:
+                                _descifrado_contextos_logueados.add(indice)
+                        if degradado:
                             nivel = "certifi" if nombre_contexto == "certifi" else "sin verificación"
                             escribir_log(
                                 LOG_COMPLETO,
                                 f"🔒 Descifrado AOD: contexto SSL degradado a {nivel}.",
                             )
-                            _descifrado_contextos_logueados.add(indice)
-                    return plano or None
-                except Exception as error_ssl:
-                    if _es_error_verificacion_ssl(error_ssl) and indice + 1 < len(contextos):
-                        continue
-                    raise
-        except urllib.error.HTTPError as e:
-            # 400 = token/tweak inválido (no tiene sentido reintentar).
-            if e.code == 400:
-                escribir_log(
-                    LOG_COMPLETO, f"🔓 Descifrado AOD: token inválido (t={token})."
-                )
-                with _descifrado_lock:
-                    _descifrado_cache[clave] = None
-                return None
-            # 403/429/5xx: backoff y reintento; al 4º fallo, rendirse.
-            if intento == 3:
-                escribir_log(
-                    LOG_COMPLETO,
-                    f"🔓 Descifrado AOD falló tras reintentos (t={token}): {e}",
-                )
-                return None
-            time.sleep(2 * (intento + 1))
-        except Exception as e:
-            if _es_error_verificacion_ssl(e):
-                # No gastar el backoff: ya se probaron los contextos disponibles.
-                escribir_log(LOG_COMPLETO, f"🔓 Descifrado AOD: falló la verificación SSL: {e}")
-                return None
-            if intento == 3:
-                escribir_log(
-                    LOG_COMPLETO,
-                    f"🔓 Descifrado AOD falló tras reintentos (t={token}): {e}",
-                )
-                return None
-            time.sleep(2 * (intento + 1))
-    return None
+                        if es_sonda:
+                            escribir_log(
+                                LOG_COMPLETO,
+                                "🔓 Descifrado AOD: la sonda exitosa cerró el corte.",
+                            )
+                        return plano or None
+                    except Exception as error_ssl:
+                        if _es_error_verificacion_ssl(error_ssl) and indice + 1 < len(contextos):
+                            continue
+                        raise
+            except urllib.error.HTTPError as e:
+                if e.code in (403, 429):
+                    registrar_bloqueo()
+                    return None
+                # 400 = token/tweak inválido (no tiene sentido reintentar).
+                if e.code == 400:
+                    escribir_log(
+                        LOG_COMPLETO, f"🔓 Descifrado AOD: token inválido (t={token})."
+                    )
+                    with _descifrado_lock:
+                        _descifrado_cache[clave] = None
+                    return None
+                # Los errores de servidor conservan los cuatro intentos actuales.
+                if intento == 3:
+                    escribir_log(
+                        LOG_COMPLETO,
+                        f"🔓 Descifrado AOD falló tras reintentos (t={token}): {e}",
+                    )
+                    return None
+                time.sleep(2 * (intento + 1))
+            except Exception as e:
+                if _es_error_verificacion_ssl(e):
+                    escribir_log(LOG_COMPLETO, f"🔓 Descifrado AOD: falló la verificación SSL: {e}")
+                    return None
+                if intento == 3:
+                    escribir_log(
+                        LOG_COMPLETO,
+                        f"🔓 Descifrado AOD falló tras reintentos (t={token}): {e}",
+                    )
+                    return None
+                time.sleep(2 * (intento + 1))
+        return None
+    finally:
+        if es_sonda:
+            with _descifrado_lock:
+                _descifrado_sonda_en_curso = False
 
 
 def registrar_link_claro(
@@ -2371,6 +2623,618 @@ def fase_restauracion(modems_activos: list) -> dict:
     return inventario
 
 
+def _iccids_coinciden(a: str, b: str) -> bool:
+    """Acepta ICCID completos con tolerancia solo al dígito de control final."""
+    a, b = _normalizar_iccid(a), _normalizar_iccid(b)
+    return bool(
+        len(a) in (19, 20)
+        and len(b) in (19, 20)
+        and a[:19] == b[:19]
+    )
+
+
+def _leer_filas_links_claro() -> list[dict[str, str]]:
+    """Lee el histórico TSV sin modificarlo ni descartar sus filas."""
+    filas = []
+    try:
+        with open(LOG_LINKS_CLARO, "r", encoding="utf-8") as archivo:
+            for linea in archivo:
+                if linea.startswith("#") or not linea.strip():
+                    continue
+                campos = linea.rstrip("\r\n").split("\t")
+                if len(campos) < 8:
+                    continue
+                filas.append(
+                    {
+                        "fecha": campos[0],
+                        "puerto": campos[1],
+                        "iccid": campos[2],
+                        "clase": campos[3],
+                        "t": campos[4],
+                        "tweak": campos[5],
+                        "numero": campos[6],
+                        "url": campos[7],
+                    }
+                )
+    except FileNotFoundError:
+        pass
+    except Exception as error:
+        escribir_log(
+            LOG_COMPLETO,
+            f"⚠️ No se pudo leer {LOG_LINKS_CLARO} para descifrado diferido: {error}",
+        )
+    return filas
+
+
+def _indice_links_resueltos(
+    filas: list[dict[str, str]],
+) -> dict[tuple[str, str], list[str]]:
+    resueltos = {}
+    for fila in filas:
+        if fila["clase"] == "DIFERIDO":
+            llave = (fila["t"], fila["tweak"])
+            resueltos.setdefault(llave, []).append(fila["iccid"])
+    return resueltos
+
+
+def _link_resuelto(
+    fila: dict[str, str], resueltos: dict[tuple[str, str], list[str]]
+) -> bool:
+    return any(
+        _iccids_coinciden(iccid, fila["iccid"])
+        for iccid in resueltos.get((fila["t"], fila["tweak"]), [])
+    )
+
+
+def _links_opacos_pendientes(iccid: str) -> list[dict[str, str]]:
+    """Devuelve hasta tres pares OPACO recientes del ICCID leído en esta corrida."""
+    filas = _leer_filas_links_claro()
+    resueltos = _indice_links_resueltos(filas)
+    por_par = {}
+    for orden, fila in enumerate(filas):
+        if (
+            fila["clase"] != "OPACO"
+            or fila["t"] in ("", "-")
+            or fila["tweak"] in ("", "-")
+            or not _iccids_coinciden(iccid, fila["iccid"])
+            or _link_resuelto(fila, resueltos)
+        ):
+            continue
+        llave = (fila["t"], fila["tweak"])
+        previo = por_par.get(llave)
+        if previo is None or (fila["fecha"], orden) > (previo["fecha"], previo["orden"]):
+            por_par[llave] = {**fila, "orden": orden}
+    recientes = sorted(
+        por_par.values(), key=lambda fila: (fila["fecha"], fila["orden"]), reverse=True
+    )
+    return [{k: v for k, v in fila.items() if k != "orden"} for fila in recientes[:3]]
+
+
+SYNC_VENTANA_DIAS = 30
+SYNC_TOPE_ICCIDS = 200
+SYNC_MAX_PARES = 3
+SYNC_PRESUPUESTO_S = 600
+SYNC_RESERVA_VALIDACION_S = 180
+_reloj_sync = time.monotonic
+_sync_deadline = None
+
+
+def _argumentos_conexion_sync():
+    """Limita la conexión a DB al tiempo restante de una sincronización."""
+    argumentos = {
+        **DB_CONFIG,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    }
+    if _sync_deadline is not None:
+        restante = _sync_deadline - _reloj_sync()
+        if restante < 1:
+            raise TimeoutError("Se agotó el presupuesto de sincronización")
+        argumentos["connect_timeout"] = min(10, max(1, int(restante)))
+        argumentos["options"] = f"-c statement_timeout={int(restante * 1000)}"
+    return argumentos
+
+
+def _validar_numero_descifrado(iccid, numero, cursor=None):
+    """Comprueba identidad y bloque de lote antes de guardar un número descifrado."""
+    iccid_normalizado = _normalizar_iccid(iccid)
+    numero_normalizado = normalizar_msisdn(numero)
+    if len(iccid_normalizado) not in (19, 20) or not numero_normalizado:
+        return False, "el ICCID o el número no tiene un formato válido"
+
+    conexion = None
+    cursor_propio = cursor is None
+    try:
+        if cursor_propio:
+            conexion = psycopg2.connect(**_argumentos_conexion_sync())
+            cursor = conexion.cursor()
+        _limitar_consulta_sync(cursor)
+        cursor.execute(
+            "SELECT iccid FROM claro_numbers WHERE numero_telefono = %s",
+            (numero_normalizado,),
+        )
+        propietarios = cursor.fetchall()
+        clave_iccid = iccid_normalizado[:19]
+        if any(
+            fila and fila[0]
+            and _normalizar_iccid(str(fila[0]))[:19] != clave_iccid
+            for fila in propietarios
+        ):
+            return False, "el número ya pertenece a otro ICCID"
+
+        _limitar_consulta_sync(cursor)
+        cursor.execute(
+            "SELECT numero_telefono FROM claro_numbers WHERE left(iccid, 15) = %s",
+            (clave_iccid[:15],),
+        )
+        numeros_lote = [
+            normalizar_msisdn(str(fila[0]))
+            for fila in cursor.fetchall()
+            if fila and fila[0]
+        ]
+        numeros_lote = [numero_lote for numero_lote in numeros_lote if numero_lote]
+        if len(numeros_lote) >= 5:
+            mediana = statistics.median(int(valor[3:]) for valor in numeros_lote)
+            if abs(int(numero_normalizado[3:]) - mediana) >= 5_000_000:
+                return False, "el número queda fuera del bloque de su lote"
+        return True, ""
+    finally:
+        if cursor_propio:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conexion is not None:
+                try:
+                    conexion.close()
+                except Exception:
+                    pass
+
+
+def _limitar_consulta_sync(cursor):
+    """Aplica a cada consulta el presupuesto que queda en la pasada."""
+    if _sync_deadline is None:
+        return
+    restante_ms = int((_sync_deadline - _reloj_sync()) * 1000)
+    if restante_ms < 1:
+        raise TimeoutError("Se agotó el presupuesto de sincronización")
+    cursor.execute(f"SET statement_timeout = {restante_ms}")
+
+
+def sincronizar_pendientes_db() -> int:
+    """Carga en Postgres números recuperables de links OPACO locales."""
+    global _sincronizados_db, _db_estado, _sync_deadline
+    global _descifrado_escrituras_desactivadas
+    inicio = _reloj_sync()
+    deadline_anterior = _sync_deadline
+    ahora = datetime.now()
+    limite = ahora - timedelta(days=SYNC_VENTANA_DIAS)
+    filas = _leer_filas_links_claro()
+    resueltos = _indice_links_resueltos(filas)
+    por_iccid = {}
+    for orden, fila in enumerate(filas):
+        iccid = _normalizar_iccid(fila.get("iccid", ""))
+        if (
+            fila.get("clase") != "OPACO"
+            or fila.get("t") in (None, "", "-")
+            or fila.get("tweak") in (None, "", "-")
+            or len(iccid) not in (19, 20)
+            or _link_resuelto(fila, resueltos)
+        ):
+            continue
+        try:
+            fecha = datetime.strptime(fila["fecha"], "%Y-%m-%d %H:%M:%S")
+        except (KeyError, TypeError, ValueError):
+            continue
+        if fecha < limite or fecha > ahora:
+            continue
+        clave = iccid[:19]
+        item = por_iccid.setdefault(clave, {"iccid": fila["iccid"], "pares": {}})
+        par = (fila["t"], fila["tweak"])
+        previo = item["pares"].get(par)
+        if previo is None or (fecha, orden) > (previo["fecha_dt"], previo["orden"]):
+            item["pares"][par] = {**fila, "fecha_dt": fecha, "orden": orden}
+
+    ordenados = sorted(
+        por_iccid.items(),
+        key=lambda entrada: max(
+            (fila["fecha_dt"] for fila in entrada[1]["pares"].values()),
+            default=datetime.min,
+        ),
+        reverse=True,
+    )
+    total_pendientes = len(ordenados)
+    cargados = 0
+    etapa = "Sincronización de links pendientes"
+
+    def presupuesto_disponible():
+        return _reloj_sync() - inicio < SYNC_PRESUPUESTO_S
+
+    def tiempo_descifrado_disponible():
+        return _reloj_sync() - inicio < SYNC_PRESUPUESTO_S - SYNC_RESERVA_VALIDACION_S
+
+    def corte_abierto():
+        with _descifrado_lock:
+            return _descifrado_corte_abierto
+
+    if corte_abierto():
+        emitir_evento(
+            "INFO", None, None, etapa,
+            f"Sincronización pausada por el corte: 0 cargados; {total_pendientes} pendientes",
+            codigo="DESCIFRADO_SINCRONIZADO",
+            datos={"cargados": 0, "pendientes": total_pendientes},
+        )
+        return 0
+
+    _sync_deadline = inicio + SYNC_PRESUPUESTO_S
+    candidatos = []
+    conexion = None
+    cursor = None
+    try:
+        filas_canario = []
+        for fila in filas:
+            iccid = _normalizar_iccid(fila.get("iccid", ""))
+            if (
+                fila.get("clase") == "OPACO"
+                and fila.get("t") not in (None, "", "-")
+                and fila.get("tweak") not in (None, "", "-")
+                and len(iccid) in (19, 20)
+            ):
+                filas_canario.append((fila, iccid[:19]))
+        filas_canario.sort(key=lambda par: par[0].get("fecha", ""), reverse=True)
+        claves_consulta = list(dict.fromkeys(
+            [clave for clave, _ in ordenados]
+            + [clave for _, clave in filas_canario]
+        ))
+        if claves_consulta:
+            conexion = psycopg2.connect(**_argumentos_conexion_sync())
+            cursor = conexion.cursor()
+            _limitar_consulta_sync(cursor)
+            cursor.execute(
+                "SELECT iccid, numero_telefono FROM claro_numbers WHERE left(iccid, 19) = ANY(%s)",
+                (claves_consulta,),
+            )
+            filas_existentes = cursor.fetchall()
+            _db_estado = "conectada"
+            existentes = {
+                _normalizar_iccid(str(fila[0]))[:19]: str(fila[1])
+                for fila in filas_existentes
+                if fila and fila[0] and fila[1]
+            }
+
+            canario = next(
+                (
+                    (fila, existentes[clave])
+                    for fila, clave in filas_canario
+                    if clave in existentes
+                ),
+                None,
+            )
+            if canario:
+                fila_canario, numero_guardado = canario
+                numero_canario = normalizar_msisdn(
+                    descifrar_token_claro(fila_canario["t"], fila_canario["tweak"])
+                )
+                if numero_canario and numero_canario != normalizar_msisdn(numero_guardado):
+                    _descifrado_escrituras_desactivadas = True
+                    emitir_evento(
+                        "AVISO", None, fila_canario.get("iccid"), etapa,
+                        "El número del canario no coincide con el guardado; posible cambio de llave de Claro.",
+                        codigo="DESCIFRADO_RECHAZADO",
+                    )
+                    return 0
+
+            existentes_iccid = set(existentes)
+            ordenados = [
+                (clave, item) for clave, item in ordenados if clave not in existentes_iccid
+            ]
+            total_pendientes = len(ordenados)
+            ordenados = ordenados[:SYNC_TOPE_ICCIDS]
+
+            cursor.close()
+            cursor = None
+            conexion.close()
+            conexion = None
+
+            for clave, item in ordenados:
+                if not tiempo_descifrado_disponible() or corte_abierto():
+                    break
+                numeros = set()
+                enlaces = sorted(
+                    item["pares"].values(),
+                    key=lambda fila: (fila["fecha_dt"], fila["orden"]),
+                    reverse=True,
+                )[:SYNC_MAX_PARES]
+                for enlace in enlaces:
+                    if not tiempo_descifrado_disponible() or corte_abierto():
+                        break
+                    numero = normalizar_msisdn(
+                        descifrar_token_claro(enlace["t"], enlace["tweak"])
+                    )
+                    if numero:
+                        numeros.add(numero)
+                if corte_abierto() or not tiempo_descifrado_disponible():
+                    break
+                if len(numeros) != 1:
+                    motivo = (
+                        "Los links devolvieron números distintos"
+                        if len(numeros) > 1
+                        else "Los links no produjeron un número móvil válido"
+                    )
+                    emitir_evento(
+                        "AVISO", None, item["iccid"], etapa, motivo,
+                        codigo="DESCIFRADO_RECHAZADO",
+                    )
+                    _iccid_sync_rechazados.add(clave)
+                    continue
+                candidatos.append((clave, item["iccid"], next(iter(numeros))))
+
+            if candidatos and presupuesto_disponible() and not corte_abierto():
+                conexion = psycopg2.connect(**_argumentos_conexion_sync())
+                cursor = conexion.cursor()
+                _db_estado = "conectada"
+                candidatos_por_numero = {}
+                for clave, _, numero in candidatos:
+                    candidatos_por_numero.setdefault(numero, set()).add(clave)
+                permitidos = []
+                for clave, iccid, numero in candidatos:
+                    motivos = []
+                    if len(candidatos_por_numero[numero]) > 1:
+                        motivos.append("el número se repite entre ICCID de esta sincronización")
+                    valido, motivo = _validar_numero_descifrado(iccid, numero, cursor)
+                    if not valido:
+                        motivos.append(motivo)
+                    if motivos:
+                        _iccid_sync_rechazados.add(clave)
+                        emitir_evento(
+                            "AVISO", None, iccid, etapa,
+                            "No se cargó el link pendiente: " + "; ".join(motivos),
+                            codigo="DESCIFRADO_RECHAZADO",
+                        )
+                    else:
+                        permitidos.append((clave, iccid, numero))
+
+                for clave, iccid, numero in permitidos:
+                    if not presupuesto_disponible() or corte_abierto():
+                        break
+                    if _guardar_numero_db(iccid, numero, "-", solo_si_vacio=True):
+                        enlaces = sorted(
+                            por_iccid[clave]["pares"].values(),
+                            key=lambda fila: (fila["fecha_dt"], fila["orden"]),
+                            reverse=True,
+                        )[:SYNC_MAX_PARES]
+                        for enlace in enlaces:
+                            registrar_link_claro(
+                                "-", iccid, "DIFERIDO", enlace["t"],
+                                enlace["tweak"], numero, enlace["url"],
+                            )
+                        cargados += 1
+                        _sincronizados_db += 1
+                    else:
+                        break
+    except TimeoutError:
+        escribir_log(
+            LOG_COMPLETO,
+            "⚠️ Se agotó el presupuesto de la sincronización; la base no se marcó como caída.",
+        )
+    except Exception as error:
+        _db_estado = "caída"
+        escribir_log(
+            LOG_COMPLETO,
+            f"⚠️ No se sincronizaron datos pendientes: base no disponible ({type(error).__name__}).",
+        )
+        emitir_evento(
+            "ERROR", None, None, etapa,
+            f"No se sincronizaron datos pendientes: base de datos no disponible ({type(error).__name__}).",
+            codigo="DB_ERROR",
+        )
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conexion is not None:
+            try:
+                conexion.close()
+            except Exception:
+                pass
+        _sync_deadline = deadline_anterior
+
+    emitir_evento(
+        "INFO", None, None, etapa,
+        f"Sincronización terminada: {cargados} cargados; {max(0, total_pendientes - cargados)} pendientes",
+        codigo="DESCIFRADO_SINCRONIZADO",
+        datos={"cargados": cargados, "pendientes": max(0, total_pendientes - cargados)},
+    )
+    return cargados
+
+
+def _contar_links_pendientes() -> int:
+    filas = _leer_filas_links_claro()
+    resueltos = _indice_links_resueltos(filas)
+    with _estado_lock:
+        candidatos = [
+            _normalizar_iccid(registro.get("iccid", ""))
+            for puerto, registro in _estado_flota.items()
+            if puerto in _puertos_respondieron_at
+            and registro.get("estado") in ("sin_numero", "rechazado_claro")
+            and not registro.get("numero")
+        ]
+    pendientes = []
+    for fila in filas:
+        if (
+            fila["clase"] != "OPACO"
+            or fila["t"] in ("", "-")
+            or fila["tweak"] in ("", "-")
+            or _link_resuelto(fila, resueltos)
+        ):
+            continue
+        iccid = _normalizar_iccid(fila["iccid"])
+        if any(_iccids_coinciden(iccid, candidato) for candidato in candidatos):
+            if not any(_iccids_coinciden(iccid, visto) for visto in pendientes):
+                pendientes.append(iccid)
+    return len(pendientes)
+
+
+def _procesar_diferido_puerto(puerto: str, inventario: dict) -> bool:
+    """Recupera myphone desde links OPACO cuando Fase 0 no halló registro."""
+    registro = inventario.get(puerto, {})
+    iccid = _normalizar_iccid(registro.get("iccid", ""))
+    if (
+        not iccid
+        or registro.get("detalle") != "sin registro previo"
+        or registro.get("numero")
+        or registro.get("error")
+    ):
+        return False
+
+    if (
+        _etapa_actual != "Descifrado diferido"
+        or _descifrado_escrituras_desactivadas
+        or iccid[:19] in _iccid_sync_rechazados
+    ):
+        return False
+
+    with _descifrado_lock:
+        if _descifrado_corte_abierto:
+            return False
+
+    try:
+        with ModemSession(puerto):
+            if leer_numero_agenda(puerto):
+                return False
+    except Exception as error:
+        escribir_log(
+            LOG_RESTAURACION,
+            f"⚠️ [{puerto}] No se pudo confirmar agenda vacía antes del descifrado diferido: {type(error).__name__}.",
+        )
+        return False
+
+    enlaces = _links_opacos_pendientes(iccid)
+    if not enlaces:
+        return False
+
+    validos = []
+    for enlace in enlaces:
+        plano = descifrar_token_claro(enlace["t"], enlace["tweak"])
+        numero = normalizar_msisdn(plano)
+        if numero:
+            validos.append((numero, enlace))
+    numeros = {numero for numero, _ in validos}
+    if not numeros:
+        return False
+    if len(numeros) > 1:
+        emitir_evento(
+            "AVISO",
+            puerto,
+            iccid,
+            "Descifrado diferido",
+            "Los links pendientes de este ICCID devolvieron números distintos; no se modificó la agenda.",
+            codigo="DESCIFRADO_RECHAZADO",
+        )
+        _iccid_sync_rechazados.add(iccid[:19])
+        return False
+
+    numero = next(iter(numeros))
+    enlaces_validos = [enlace for valor, enlace in validos if valor == numero]
+    try:
+        valido, motivo = _validar_numero_descifrado(iccid, numero)
+    except Exception as error:
+        emitir_evento(
+            "ERROR", puerto, iccid, "Descifrado diferido",
+            f"No se validó el número descifrado por un error de base de datos ({type(error).__name__}).",
+            codigo="DB_ERROR",
+        )
+        return False
+    if not valido:
+        _iccid_sync_rechazados.add(iccid[:19])
+        emitir_evento(
+            "AVISO", puerto, iccid, "Descifrado diferido",
+            "No se guardó el número descifrado: " + motivo + ".",
+            codigo="DESCIFRADO_RECHAZADO",
+        )
+        return False
+    if _etapa_actual != "Descifrado diferido" or _descifrado_escrituras_desactivadas:
+        return False
+    if not _guardar_numero_db(iccid, numero, puerto, solo_si_vacio=True):
+        return False
+    try:
+        with ModemSession(puerto):
+            if leer_numero_agenda(puerto):
+                escribir_log(
+                    LOG_RESTAURACION,
+                    f"⚠️ [{puerto}] La agenda se ocupó después de confirmar la escritura en base de datos.",
+                )
+                return False
+            if not restaurar_numero_en_sim(puerto, numero):
+                escribir_log(
+                    LOG_RESTAURACION,
+                    f"⚠️ [{puerto}] El número descifrado no verificó en myphone.",
+                )
+                return False
+    except Exception as error:
+        escribir_log(
+            LOG_RESTAURACION,
+            f"⚠️ [{puerto}] Falló la recuperación diferida: {type(error).__name__}.",
+        )
+        return False
+
+    emitir_evento(
+        "INFO",
+        puerto,
+        iccid,
+        _etapa_actual,
+        "Número verificado en agenda como myphone",
+        "activo",
+        codigo="MYPHONE_VERIFICADO",
+    )
+
+    for enlace in enlaces_validos:
+        registrar_link_claro(
+            puerto,
+            iccid,
+            "DIFERIDO",
+            enlace["t"],
+            enlace["tweak"],
+            numero,
+            enlace["url"],
+        )
+    registro.update(
+        {
+            "numero": numero,
+            "restaurado": True,
+            "fuente": "descifrado_diferido",
+            "detalle": "recuperado desde descifrado diferido",
+            "error": "",
+        }
+    )
+    with _estado_lock:
+        _restaurados_v4.add(puerto)
+        _recuperados_diferido.add(puerto)
+    actualizar_estado(
+        puerto,
+        iccid=iccid,
+        numero=numero,
+        estado="activo",
+        causa="",
+        ultimo_error="",
+    )
+    emitir_evento(
+        "INFO",
+        puerto,
+        iccid,
+        "Descifrado diferido",
+        "Número recuperado desde un link pendiente y verificado en myphone",
+        "activo",
+        codigo="DESCIFRADO_DIFERIDO",
+    )
+    return True
+
+
 # ============================
 # 🔄 Función procesar_puerto (refactor clave)
 # ============================
@@ -2681,6 +3545,10 @@ ESPERA_RESPUESTA_ACTIVACION = 10.0
 INTERVALO_SONDEO_ACTIVACION = 2.0
 _nuevos_activados: dict[str, tuple[str, str]] = {}
 _restaurados_v4: set[str] = set()
+_recuperados_diferido: set[str] = set()
+_sincronizados_db = 0
+_descifrado_escrituras_desactivadas = False
+_iccid_sync_rechazados: set[str] = set()
 _etapa_actual = "Inicio"
 _inicio_corrida = time.monotonic()
 _tiempos_etapa: dict[str, float] = {}
@@ -3322,6 +4190,111 @@ def cargar_indice_numeros(iccid_flota=None) -> tuple[dict[str, str], bool]:
         return _leer_listado(), False
 
 
+def _guardar_numero_db(iccid, numero, puerto, solo_si_vacio=False) -> bool:
+    """Sincroniza el número en Postgres e informa éxito solo tras el commit."""
+    global _db_estado
+    conn = None
+    cur = None
+    try:
+        conn = psycopg2.connect(**_argumentos_conexion_sync())
+        cur = conn.cursor()
+        _limitar_consulta_sync(cur)
+        if solo_si_vacio:
+            iccid_completo = _normalizar_iccid(iccid)
+            if len(iccid_completo) not in (19, 20):
+                cur.close()
+                conn.close()
+                return False
+            clave_iccid = iccid_completo[:19]
+            cur.execute(
+                "SELECT numero_telefono FROM claro_numbers WHERE left(iccid, 19) = %s",
+                (clave_iccid,),
+            )
+            previos = cur.fetchall()
+            if any(fila and fila[0] is not None and str(fila[0]).strip() for fila in previos):
+                _db_estado = "conectada"
+                cur.close()
+                conn.close()
+                return False
+            _limitar_consulta_sync(cur)
+            if previos:
+                cur.execute(
+                    "UPDATE claro_numbers SET numero_telefono=%s, fecha_activacion=%s "
+                    "WHERE left(iccid, 19) = %s AND (numero_telefono IS NULL OR btrim(numero_telefono) = '')",
+                    (numero, datetime.now(), clave_iccid),
+                )
+                if not getattr(cur, "rowcount", 0):
+                    _db_estado = "conectada"
+                    cur.close()
+                    conn.close()
+                    return False
+            else:
+                cur.execute(
+                    "INSERT INTO claro_numbers (iccid, numero_telefono, fecha_activacion) "
+                    "SELECT %s, %s, %s WHERE NOT EXISTS (SELECT 1 FROM claro_numbers "
+                    "WHERE left(iccid, 19) = %s AND numero_telefono IS NOT NULL AND btrim(numero_telefono) <> '')",
+                    (iccid_completo, numero, datetime.now(), clave_iccid),
+                )
+                if not getattr(cur, "rowcount", 0):
+                    _db_estado = "conectada"
+                    cur.close()
+                    conn.close()
+                    return False
+        else:
+            cur.execute(
+                "SELECT numero_telefono FROM claro_numbers WHERE iccid = %s", (iccid,)
+            )
+            previo = cur.fetchone()
+            if previo:
+                _limitar_consulta_sync(cur)
+                cur.execute(
+                    "UPDATE claro_numbers SET numero_telefono=%s, fecha_activacion=%s WHERE iccid=%s",
+                    (numero, datetime.now(), iccid),
+                )
+            else:
+                _limitar_consulta_sync(cur)
+                cur.execute(
+                    "INSERT INTO claro_numbers (iccid, numero_telefono, fecha_activacion) VALUES (%s, %s, %s)",
+                    (iccid, numero, datetime.now()),
+                )
+        _limitar_consulta_sync(cur)
+        conn.commit()
+        cur.close()
+        conn.close()
+        _db_estado = "conectada"
+        emitir_evento(
+            "INFO",
+            puerto,
+            iccid,
+            _etapa_actual,
+            "Número sincronizado con la base de datos",
+            codigo="DB_OK",
+        )
+        return True
+    except Exception as exc:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+        _db_estado = "caída"
+        emitir_evento(
+            "ERROR",
+            puerto,
+            iccid,
+            _etapa_actual,
+            f"No se guardó en BDD ({type(exc).__name__})",
+            codigo="DB_ERROR",
+        )
+        return False
+
+
 def guardar_resultado(iccid, numero, puerto):
     """Guarda número en SIM y DB; el listado local se actualiza solo al cierre."""
     global _db_estado
@@ -3348,45 +4321,7 @@ def guardar_resultado(iccid, numero, puerto):
     actualizar_estado(
         puerto, iccid=iccid, numero=numero, estado="activo", causa="", ultimo_error=""
     )
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT numero_telefono FROM claro_numbers WHERE iccid = %s", (iccid,)
-        )
-        previo = cur.fetchone()
-        if previo:
-            cur.execute(
-                "UPDATE claro_numbers SET numero_telefono=%s, fecha_activacion=%s WHERE iccid=%s",
-                (numero, datetime.now(), iccid),
-            )
-        else:
-            cur.execute(
-                "INSERT INTO claro_numbers (iccid, numero_telefono, fecha_activacion) VALUES (%s, %s, %s)",
-                (iccid, numero, datetime.now()),
-            )
-        conn.commit()
-        cur.close()
-        conn.close()
-        _db_estado = "conectada"
-        emitir_evento(
-            "INFO",
-            puerto,
-            iccid,
-            _etapa_actual,
-            "Número sincronizado con la base de datos",
-            codigo="DB_OK",
-        )
-    except Exception as exc:
-        _db_estado = "caída"
-        emitir_evento(
-            "ERROR",
-            puerto,
-            iccid,
-            _etapa_actual,
-            f"No se guardó en BDD ({type(exc).__name__})",
-            codigo="DB_ERROR",
-        )
+    _guardar_numero_db(iccid, numero, puerto)
     emitir_evento(
         "INFO",
         puerto,
@@ -4147,7 +5082,10 @@ def construir_resumen():
         f"Resumen corrida Claro V{VERSION}",
         f"Activos/total: {activos}/{total}",
         f"Nuevos activados: {len(_nuevos_activados)}",
-        f"Recuperados en Fase 0: {len(_restaurados_v4)}",
+        f"Recuperados en Fase 0: {len(_restaurados_v4 - _recuperados_diferido)}",
+        f"Recuperados diferido: {len(_recuperados_diferido)}",
+        f"Sincronizados en DB: {_sincronizados_db}",
+        f"Links pendientes: {_contar_links_pendientes()}",
         f"Nunca intentados: {nunca_intentados}",
         f"Intentados sin número: {intentados_sin_numero}",
         f"Sin número por causa: {dict(causas)}",
@@ -4224,6 +5162,8 @@ def ejecutar_corrida(sin_ui=False):
     iniciar_dashboard(sin_ui)
     _etapa_actual = "Triage"
     t_etapa = time.monotonic()
+    if _pasada_actual == 1:
+        sincronizar_pendientes_db()
     cerrar_herosms()
     verificar_y_actualizar()
     puertos = listar_puertos_disponibles()
@@ -4269,6 +5209,44 @@ def ejecutar_corrida(sin_ui=False):
             )
     _tiempos_etapa["Fase 0"] = (
         _tiempos_etapa.get("Fase 0", 0) + time.monotonic() - t_etapa
+    )
+    _etapa_actual = "Descifrado diferido"
+    t_etapa = time.monotonic()
+    candidatos_diferidos = [
+        puerto
+        for puerto in filtrar_muertos(listos)
+        if inventario.get(puerto, {}).get("detalle") == "sin registro previo"
+        and not inventario.get(puerto, {}).get("numero")
+        and not inventario.get(puerto, {}).get("error")
+    ]
+    with _descifrado_lock:
+        corte_abierto = _descifrado_corte_abierto
+    if candidatos_diferidos and not corte_abierto:
+        correr_en_hilos(
+            _procesar_diferido_puerto,
+            candidatos_diferidos,
+            DEADLINE_DIFERIDO,
+            _etapa_actual,
+            args_extra=(inventario,),
+            marcar_muertos=False,
+        )
+    with _estado_lock:
+        _restaurados_v4.update(
+            puerto
+            for puerto in candidatos_diferidos
+            if inventario.get(puerto, {}).get("restaurado")
+        )
+    for puerto in candidatos_diferidos:
+        registro = inventario.get(puerto, {})
+        if registro.get("restaurado") and registro.get("numero"):
+            actualizar_estado(
+                puerto,
+                iccid=registro.get("iccid"),
+                numero=registro["numero"],
+                estado="activo",
+            )
+    _tiempos_etapa["Descifrado diferido"] = (
+        _tiempos_etapa.get("Descifrado diferido", 0) + time.monotonic() - t_etapa
     )
     pendientes = [p for p in listos if _registro_estado(p).get("estado") != "activo"]
     if pendientes:
@@ -9578,6 +10556,26 @@ CODIGOS = {
         "Falló la restauración de agenda",
         "Revisar el módem y el detalle del evento",
     ),
+    "DESCIFRADO_BLOQUEADO": (
+        "Claro bloqueó la API de descifrado (403/429)",
+        "No abras varios activadores a la vez en la misma red; los links quedan pendientes y se descifran en la próxima corrida",
+    ),
+    "DESCIFRADO_PROXY_ERROR": (
+        "El proxy de descifrado falló (sin saldo, credencial o red)",
+        "Revisar saldo en Proxy-Cheap y proxy_claro.txt; mientras tanto se consulta directo",
+    ),
+    "DESCIFRADO_DIFERIDO": (
+        "Se recuperó el número desde un link pendiente",
+        "Confirmar MYPHONE_VERIFICADO y DB_OK",
+    ),
+    "DESCIFRADO_SINCRONIZADO": (
+        "Se cargaron a la base números de links pendientes",
+        "Ninguna: al conectar esos chips en cualquier PC, la Fase 0 escribe el número",
+    ),
+    "DESCIFRADO_RECHAZADO": (
+        "Un número descifrado no pasó los chequeos (otro ICCID, repetido, fuera de bloque o links que no coinciden)",
+        "Revisar a mano: no se escribió nada",
+    ),
     "USSD_ENVIADO": (
         "Se escribió el comando de activación",
         "Esperar respuesta de Claro",
@@ -9697,6 +10695,10 @@ def _reset_corrida():
         _eventos_persistidos
     global _ussd_pendientes_cierre
     global _pasada_actual, _ronda_actual, _lote_actual, _etapa_actual, _db_estado
+    global _sincronizados_db
+    global _descifrado_escrituras_desactivadas, _iccid_sync_rechazados
+    global _proxy_claro_leido, _proxy_claro_config, _proxy_claro_caido
+    global _proxy_claro_evento_emitido
     with _estado_lock:
         _corrida_id = str(uuid.uuid4())
         _eventos_persistidos = True
@@ -9707,6 +10709,10 @@ def _reset_corrida():
         _total_duracion_corrida = None
         _pasada_actual, _ronda_actual, _lote_actual = 1, 1, None
         _etapa_actual, _db_estado = "Inicio", "sin intentar"
+        _proxy_claro_leido = False
+        _proxy_claro_config = None
+        _proxy_claro_caido = False
+        _proxy_claro_evento_emitido = False
         _errores.clear()
         _estado_flota.clear()
         _puertos_respondieron_at.clear()
@@ -9714,6 +10720,10 @@ def _reset_corrida():
         _intentos_por_iccid.clear()
         _nuevos_activados.clear()
         _restaurados_v4.clear()
+        _recuperados_diferido.clear()
+        _sincronizados_db = 0
+        _descifrado_escrituras_desactivadas = False
+        _iccid_sync_rechazados.clear()
         _tiempos_etapa.clear()
         _contador_codigos.clear()
         _ultimo_codigo_puerto.clear()
@@ -9744,6 +10754,13 @@ def _sanitizar(valor):
     try:
         if API_DESCIFRADO_AUTH:
             secretos.append(str(API_DESCIFRADO_AUTH))
+    except Exception:
+        pass
+    try:
+        proxy_config = _leer_proxy_claro()
+        if proxy_config:
+            secretos.extend(str(valor) for valor in proxy_config["secretos"] if valor)
+            secretos.append(proxy_config["proxy"])
     except Exception:
         pass
 
@@ -10295,7 +11312,7 @@ def construir_resumen_json():
         ultimo_codigo = dict(_ultimo_codigo_puerto)
         codigos = dict(_contador_codigos)
         total_nuevos = len(_nuevos_activados)
-        total_restaurados = len(_restaurados_v4)
+        total_restaurados = len(_restaurados_v4 - _recuperados_diferido)
         duracion_etapas = dict(_tiempos_etapa)
         eventos_persistidos = _eventos_persistidos
         pendientes = (
@@ -10342,6 +11359,9 @@ def construir_resumen_json():
         "por_estado": dict(conteos),
         "por_codigo": codigos,
         "duracion_por_etapa": duracion_etapas,
+        "recuperados_diferido": len(_recuperados_diferido),
+        "sincronizados_db": _sincronizados_db,
+        "links_pendientes": _contar_links_pendientes(),
         "ussd_enviados": intentos,
         "puertos": estados,
         "eventos_persistidos": eventos_persistidos,
@@ -10671,6 +11691,11 @@ def main(sin_ui=False):
         resultado = ejecutar_corrida(sin_ui=sin_ui)
         if resultado in ("abrir_herosms", "sin_modems"):
             break
+    with _descifrado_lock:
+        corte_abierto = _descifrado_corte_abierto
+    if not corte_abierto:
+        _etapa_actual = "Cierre"
+        sincronizar_pendientes_db()
     _total_duracion_corrida = time.monotonic() - _inicio_corrida
     _etapa_actual = "Cierre"
     emitir_evento(
