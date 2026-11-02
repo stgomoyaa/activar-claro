@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "4.3.0"
+VERSION = "4.3.1"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import time
@@ -2737,8 +2737,12 @@ def _argumentos_conexion_sync():
     return argumentos
 
 
-def _validar_numero_descifrado(iccid, numero, cursor=None):
-    """Comprueba identidad y bloque de lote antes de guardar un número descifrado."""
+def _validar_numero_descifrado(iccid, numero, cursor=None, con_bloque=True):
+    """Comprueba identidad y bloque de lote antes de guardar un número descifrado.
+
+    `con_bloque=False` para números leídos de la agenda: medido el 2026-11-02,
+    el filtro de bloque marcaba 6.941 de 17.162 pares ya verificados en la DB.
+    """
     iccid_normalizado = _normalizar_iccid(iccid)
     numero_normalizado = normalizar_msisdn(numero)
     if len(iccid_normalizado) not in (19, 20) or not numero_normalizado:
@@ -2763,6 +2767,8 @@ def _validar_numero_descifrado(iccid, numero, cursor=None):
             for fila in propietarios
         ):
             return False, "el número ya pertenece a otro ICCID"
+        if not con_bloque:
+            return True, ""
 
         _limitar_consulta_sync(cursor)
         cursor.execute(
@@ -5188,7 +5194,9 @@ def _registrar_agendas_en_db(inventario: dict, desde_db: bool) -> int:
                 continue
 
             try:
-                valido, motivo = _validar_numero_descifrado(iccid, numero)
+                valido, motivo = _validar_numero_descifrado(
+                    iccid, numero, con_bloque=False
+                )
             except Exception as exc:
                 valido = False
                 if _es_timeout_presupuesto(exc):
@@ -5290,7 +5298,9 @@ def _reintentar_agendas_pendientes_db() -> int:
                 puede_consultar_db = False
                 continue
             try:
-                valido, motivo = _validar_numero_descifrado(iccid, numero)
+                valido, motivo = _validar_numero_descifrado(
+                    iccid, numero, con_bloque=False
+                )
             except Exception as exc:
                 valido = False
                 if _es_timeout_presupuesto(exc):
@@ -5527,7 +5537,10 @@ def ejecutar_corrida(sin_ui=False):
         _tiempos_etapa.get("Fase 0", 0) + time.monotonic() - t_etapa
     )
     _etapa_actual = "Registro desde agenda"
-    _registrar_agendas_en_db(inventario, desde_db)
+    try:
+        _registrar_agendas_en_db(inventario, desde_db)
+    except Exception as e:
+        escribir_log(LOG_COMPLETO, f"⚠️ Falló el registro desde agenda, sigo: {e}")
     _etapa_actual = "Descifrado diferido"
     t_etapa = time.monotonic()
     candidatos_diferidos = [
@@ -5622,8 +5635,11 @@ def ejecutar_corrida(sin_ui=False):
     _lote_actual = None
     _ronda_actual = 1
     _etapa_actual = "Cierre"
-    _reintentar_agendas_pendientes_db()
-    _reintentar_escrituras_db_pendientes()
+    try:
+        _reintentar_agendas_pendientes_db()
+        _reintentar_escrituras_db_pendientes()
+    except Exception as e:
+        escribir_log(LOG_COMPLETO, f"⚠️ Falló el reintento de escrituras en la base: {e}")
     _guardar_listado_cierre()
     if _db_pendientes_reintento or _agendas_pendientes_db:
         escribir_log(
