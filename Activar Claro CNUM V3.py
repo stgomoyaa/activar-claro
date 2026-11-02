@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import time
@@ -2804,6 +2804,14 @@ def _limitar_consulta_sync(cursor):
     cursor.execute(f"SET statement_timeout = {restante_ms}")
 
 
+def _es_timeout_presupuesto(exc: Exception) -> bool:
+    return bool(
+        isinstance(exc, TimeoutError)
+        and _sync_deadline is not None
+        and _sync_deadline - _reloj_sync() < 1
+    )
+
+
 def sincronizar_pendientes_db() -> int:
     """Carga en Postgres números recuperables de links OPACO locales."""
     global _sincronizados_db, _db_estado, _sync_deadline
@@ -3544,6 +3552,12 @@ _ussd_pendientes_cierre: dict[str, dict[str, str]] | None = None
 ESPERA_RESPUESTA_ACTIVACION = 10.0
 INTERVALO_SONDEO_ACTIVACION = 2.0
 _nuevos_activados: dict[str, tuple[str, str]] = {}
+_db_pendientes_reintento: dict[str, tuple[str, str]] = {}
+_agendas_pendientes_db: dict[str, tuple[str, str]] = {}
+_agendas_en_listado: set[str] = set()
+_iccid_desde_db: set[str] = set()
+_registrados_desde_agenda = 0
+_estado_sync_db = threading.local()
 _restaurados_v4: set[str] = set()
 _recuperados_diferido: set[str] = set()
 _sincronizados_db = 0
@@ -4143,7 +4157,7 @@ def _leer_listado(path: str = LISTADO_NUMEROS) -> dict[str, str]:
 
 
 def cargar_indice_numeros(iccid_flota=None) -> tuple[dict[str, str], bool]:
-    global _db_estado
+    global _db_estado, _iccid_desde_db
     iccid_flota = iccid_flota or [
         r.get("iccid") for r in _estado_flota.values() if r.get("iccid")
     ]
@@ -4173,9 +4187,19 @@ def cargar_indice_numeros(iccid_flota=None) -> tuple[dict[str, str], bool]:
             datos={"registros": len(filas)},
         )
         indice = {}
+        _iccid_desde_db = set()
         for numero, iccid in filas:
             if numero and iccid:
-                indice[_normalizar_iccid(str(iccid))] = str(numero)
+                clave = _normalizar_iccid(str(iccid))
+                indice[clave] = str(numero)
+                _iccid_desde_db.update(_variantes_iccid(clave))
+        listado = _leer_listado()
+        for clave, numero in listado.items():
+            variantes_clave = _variantes_iccid(clave)
+            if not variantes_clave.intersection(variantes):
+                continue
+            if not variantes_clave.intersection(_iccid_desde_db):
+                indice.setdefault(clave, numero)
         return indice, True
     except Exception as exc:
         _db_estado = "caída"
@@ -4187,12 +4211,20 @@ def cargar_indice_numeros(iccid_flota=None) -> tuple[dict[str, str], bool]:
             f"BDD caída; usando listado local ({type(exc).__name__})",
             codigo="DB_ERROR",
         )
-        return _leer_listado(), False
+        _iccid_desde_db = set()
+        listado = _leer_listado()
+        listado = {
+            clave: numero
+            for clave, numero in listado.items()
+            if _variantes_iccid(clave).intersection(variantes)
+        }
+        return listado, False
 
 
 def _guardar_numero_db(iccid, numero, puerto, solo_si_vacio=False) -> bool:
     """Sincroniza el número en Postgres e informa éxito solo tras el commit."""
     global _db_estado
+    _estado_sync_db.presupuesto_agotado = False
     conn = None
     cur = None
     try:
@@ -4272,6 +4304,8 @@ def _guardar_numero_db(iccid, numero, puerto, solo_si_vacio=False) -> bool:
         )
         return True
     except Exception as exc:
+        presupuesto_agotado = _es_timeout_presupuesto(exc)
+        _estado_sync_db.presupuesto_agotado = presupuesto_agotado
         if cur is not None:
             try:
                 cur.close()
@@ -4283,14 +4317,18 @@ def _guardar_numero_db(iccid, numero, puerto, solo_si_vacio=False) -> bool:
                 conn.close()
             except Exception:
                 pass
-        _db_estado = "caída"
+        if not presupuesto_agotado:
+            _db_estado = "caída"
         emitir_evento(
-            "ERROR",
+            "AVISO" if presupuesto_agotado else "ERROR",
             puerto,
             iccid,
             _etapa_actual,
             f"No se guardó en BDD ({type(exc).__name__})",
             codigo="DB_ERROR",
+            datos={"motivo": "presupuesto agotado"}
+            if presupuesto_agotado
+            else None,
         )
         return False
 
@@ -4321,7 +4359,9 @@ def guardar_resultado(iccid, numero, puerto):
     actualizar_estado(
         puerto, iccid=iccid, numero=numero, estado="activo", causa="", ultimo_error=""
     )
-    _guardar_numero_db(iccid, numero, puerto)
+    if not _guardar_numero_db(iccid, numero, puerto):
+        with _estado_lock:
+            _db_pendientes_reintento[iccid] = (numero, puerto)
     emitir_evento(
         "INFO",
         puerto,
@@ -5048,11 +5088,286 @@ def _lotes_activacion(pendientes, velocidad=None):
 
 
 def _guardar_listado_cierre():
-    if not _nuevos_activados:
+    with _estado_lock:
+        nuevos = dict(_nuevos_activados)
+        pendientes_agenda = dict(_agendas_pendientes_db)
+    if not nuevos:
         return
+    filas = [
+        (iccid, registro)
+        for iccid, registro in nuevos.items()
+        if iccid not in pendientes_agenda
+    ]
+    filas.extend(pendientes_agenda.items())
     with open(LISTADO_NUMEROS, "a", encoding="utf-8") as f:
-        for iccid, (numero, _) in _nuevos_activados.items():
+        for iccid, (numero, _) in filas:
             f.write(f"{numero}={iccid}\n")
+
+
+def _contar_nuevos_activados() -> int:
+    with _estado_lock:
+        return sum(
+            1 for iccid in _nuevos_activados if iccid not in _agendas_en_listado
+        )
+
+
+def _encolar_agenda_pendiente(iccid: str, numero: str, puerto: str):
+    """Conserva localmente un candidato seguro que falta sincronizar con DB."""
+    with _estado_lock:
+        _nuevos_activados[iccid] = (numero, puerto)
+        _agendas_en_listado.add(iccid)
+        _agendas_pendientes_db[iccid] = (numero, puerto)
+
+
+def _descartar_agenda_pendiente(iccid: str, registro: tuple[str, str]):
+    """Retira del listado local un candidato de agenda que no pasó las guardas."""
+    with _estado_lock:
+        if _agendas_pendientes_db.get(iccid) == registro:
+            _agendas_pendientes_db.pop(iccid, None)
+        if _nuevos_activados.get(iccid) == registro:
+            _nuevos_activados.pop(iccid, None)
+        _agendas_en_listado.discard(iccid)
+
+
+def _evento_agenda_no_registrada(puerto: str, iccid: str, motivo: str):
+    emitir_evento(
+        "AVISO",
+        puerto,
+        iccid,
+        "fase0",
+        "Número leído de agenda no registrado en la base de datos",
+        codigo="AGENDA_NO_REGISTRADA_DB",
+        datos={"motivo": motivo},
+    )
+
+
+def _registrar_agendas_en_db(inventario: dict, desde_db: bool) -> int:
+    """Persiste en serie agendas elegibles y conserva pendientes para reintento."""
+    global _sync_deadline, _registrados_desde_agenda, _db_estado
+    with restauracion_lock:
+        registros = list(inventario.items())
+    deadline_anterior = _sync_deadline
+    _sync_deadline = _reloj_sync() + min(SYNC_PRESUPUESTO_S, 60)
+    _estado_sync_db.presupuesto_agotado = False
+    registrados = 0
+    try:
+        falsos_por_iccid = numeros_falsos_por_iccid()
+        puede_consultar_db = desde_db
+        for puerto, registro in registros:
+            iccid = _normalizar_iccid(registro.get("iccid", ""))
+            numero = normalizar_msisdn(registro.get("numero"))
+            if (
+                not numero
+                or not iccid
+                or registro.get("error")
+                or registro.get("operador") != "Claro"
+            ):
+                continue
+            variantes = _variantes_iccid(iccid)
+            if variantes.intersection(_iccid_desde_db):
+                continue
+            if numero in buscar_falsos(iccid, falsos_por_iccid):
+                _evento_agenda_no_registrada(
+                    puerto, iccid, "número marcado como token cifrado"
+                )
+                continue
+
+            if (
+                not puede_consultar_db
+                or _db_estado == "caída"
+                or _reloj_sync() >= _sync_deadline
+            ):
+                motivo = (
+                    "base de datos no disponible"
+                    if _db_estado == "caída" or not desde_db
+                    else "presupuesto de sincronización agotado"
+                )
+                _encolar_agenda_pendiente(iccid, numero, puerto)
+                _evento_agenda_no_registrada(puerto, iccid, motivo)
+                puede_consultar_db = False
+                continue
+
+            try:
+                valido, motivo = _validar_numero_descifrado(iccid, numero)
+            except Exception as exc:
+                valido = False
+                if _es_timeout_presupuesto(exc):
+                    motivo = "presupuesto de sincronización agotado"
+                else:
+                    _db_estado = "caída"
+                    motivo = f"validación falló ({type(exc).__name__})"
+                _encolar_agenda_pendiente(iccid, numero, puerto)
+                _evento_agenda_no_registrada(puerto, iccid, motivo)
+                puede_consultar_db = False
+                continue
+
+            if not valido:
+                _evento_agenda_no_registrada(puerto, iccid, motivo)
+                continue
+            if _reloj_sync() >= _sync_deadline:
+                _encolar_agenda_pendiente(iccid, numero, puerto)
+                _evento_agenda_no_registrada(
+                    puerto, iccid, "presupuesto de sincronización agotado"
+                )
+                puede_consultar_db = False
+                continue
+
+            error_es_timeout = False
+            _estado_sync_db.presupuesto_agotado = False
+            try:
+                guardado = _guardar_numero_db(
+                    iccid, numero, puerto, solo_si_vacio=True
+                )
+            except Exception as exc:
+                guardado = False
+                error_es_timeout = _es_timeout_presupuesto(exc)
+                if not error_es_timeout:
+                    _db_estado = "caída"
+                motivo = f"falló la escritura ({type(exc).__name__})"
+            if guardado:
+                with _estado_lock:
+                    _nuevos_activados[iccid] = (numero, puerto)
+                    _agendas_en_listado.add(iccid)
+                    _registrados_desde_agenda += 1
+                registrados += 1
+                emitir_evento(
+                    "INFO",
+                    puerto,
+                    iccid,
+                    "fase0",
+                    "Número de agenda registrado en la base de datos",
+                    codigo="AGENDA_REGISTRADA_DB",
+                )
+                continue
+
+            presupuesto_agotado = getattr(
+                _estado_sync_db, "presupuesto_agotado", False
+            ) or error_es_timeout
+            if presupuesto_agotado or _db_estado == "caída":
+                motivo = (
+                    "presupuesto de sincronización agotado"
+                    if presupuesto_agotado
+                    else "base de datos no disponible"
+                )
+                _encolar_agenda_pendiente(iccid, numero, puerto)
+                _evento_agenda_no_registrada(puerto, iccid, motivo)
+                puede_consultar_db = False
+                continue
+
+            _evento_agenda_no_registrada(
+                puerto,
+                iccid,
+                "la base ya tiene un número para este ICCID",
+            )
+    finally:
+        _sync_deadline = deadline_anterior
+    return registrados
+
+
+def _reintentar_agendas_pendientes_db() -> int:
+    """Revalida y reintenta agendas sin reemplazar números existentes en DB."""
+    global _sync_deadline, _registrados_desde_agenda, _db_estado
+    if not _agendas_pendientes_db:
+        return 0
+    deadline_anterior = _sync_deadline
+    _sync_deadline = _reloj_sync() + 30
+    falsos_por_iccid = numeros_falsos_por_iccid()
+    sincronizados = 0
+    puede_consultar_db = True
+    try:
+        for iccid, registro in list(_agendas_pendientes_db.items()):
+            numero, puerto = registro
+            if numero in buscar_falsos(iccid, falsos_por_iccid):
+                _descartar_agenda_pendiente(iccid, registro)
+                _evento_agenda_no_registrada(
+                    puerto, iccid, "número marcado como token cifrado"
+                )
+                continue
+            if (
+                not puede_consultar_db
+                or _reloj_sync() >= _sync_deadline
+            ):
+                puede_consultar_db = False
+                continue
+            try:
+                valido, motivo = _validar_numero_descifrado(iccid, numero)
+            except Exception as exc:
+                valido = False
+                if _es_timeout_presupuesto(exc):
+                    motivo = "presupuesto de sincronización agotado"
+                else:
+                    _db_estado = "caída"
+                    motivo = f"validación falló ({type(exc).__name__})"
+                _evento_agenda_no_registrada(puerto, iccid, motivo)
+                puede_consultar_db = False
+                continue
+            if not valido:
+                _descartar_agenda_pendiente(iccid, registro)
+                _evento_agenda_no_registrada(puerto, iccid, motivo)
+                continue
+            if _reloj_sync() >= _sync_deadline:
+                puede_consultar_db = False
+                continue
+            try:
+                _estado_sync_db.presupuesto_agotado = False
+                guardado = _guardar_numero_db(
+                    iccid, numero, puerto, solo_si_vacio=True
+                )
+            except Exception as exc:
+                guardado = False
+                if not _es_timeout_presupuesto(exc):
+                    _db_estado = "caída"
+            if guardado:
+                with _estado_lock:
+                    if _agendas_pendientes_db.get(iccid) == registro:
+                        _agendas_pendientes_db.pop(iccid, None)
+                    _registrados_desde_agenda += 1
+                sincronizados += 1
+                emitir_evento(
+                    "INFO",
+                    puerto,
+                    iccid,
+                    "cierre",
+                    "Número de agenda registrado en la base de datos tras reintento",
+                    codigo="AGENDA_REGISTRADA_DB",
+                )
+                continue
+            if (
+                getattr(_estado_sync_db, "presupuesto_agotado", False)
+                or _db_estado == "caída"
+                or _reloj_sync() >= _sync_deadline
+            ):
+                puede_consultar_db = False
+                continue
+            _descartar_agenda_pendiente(iccid, registro)
+            _evento_agenda_no_registrada(
+                puerto,
+                iccid,
+                "la base ya tiene un número para este ICCID",
+            )
+    finally:
+        _sync_deadline = deadline_anterior
+    return sincronizados
+
+
+def _reintentar_escrituras_db_pendientes() -> int:
+    """Reintenta escrituras normales fallidas antes de exportar el listado."""
+    global _sync_deadline
+    if not _db_pendientes_reintento:
+        return 0
+    deadline_anterior = _sync_deadline
+    _sync_deadline = _reloj_sync() + 30
+    sincronizados = 0
+    try:
+        for iccid, (numero, puerto) in list(_db_pendientes_reintento.items()):
+            if _reloj_sync() >= _sync_deadline:
+                break
+            if _guardar_numero_db(iccid, numero, puerto):
+                _db_pendientes_reintento.pop(iccid, None)
+                sincronizados += 1
+    finally:
+        _sync_deadline = deadline_anterior
+    return sincronizados
 
 
 def construir_resumen():
@@ -5081,7 +5396,8 @@ def construir_resumen():
     lineas = [
         f"Resumen corrida Claro V{VERSION}",
         f"Activos/total: {activos}/{total}",
-        f"Nuevos activados: {len(_nuevos_activados)}",
+        f"Nuevos activados: {_contar_nuevos_activados()}",
+        f"Registrados desde agenda: {_registrados_desde_agenda}",
         f"Recuperados en Fase 0: {len(_restaurados_v4 - _recuperados_diferido)}",
         f"Recuperados diferido: {len(_recuperados_diferido)}",
         f"Sincronizados en DB: {_sincronizados_db}",
@@ -5210,6 +5526,8 @@ def ejecutar_corrida(sin_ui=False):
     _tiempos_etapa["Fase 0"] = (
         _tiempos_etapa.get("Fase 0", 0) + time.monotonic() - t_etapa
     )
+    _etapa_actual = "Registro desde agenda"
+    _registrar_agendas_en_db(inventario, desde_db)
     _etapa_actual = "Descifrado diferido"
     t_etapa = time.monotonic()
     candidatos_diferidos = [
@@ -5304,11 +5622,19 @@ def ejecutar_corrida(sin_ui=False):
     _lote_actual = None
     _ronda_actual = 1
     _etapa_actual = "Cierre"
+    _reintentar_agendas_pendientes_db()
+    _reintentar_escrituras_db_pendientes()
     _guardar_listado_cierre()
-    try:
-        exportar_base_datos_completa()
-    except Exception as e:
-        escribir_log(LOG_COMPLETO, f"⚠️ No se pudo exportar la base de datos al cierre: {e}")
+    if _db_pendientes_reintento or _agendas_pendientes_db:
+        escribir_log(
+            LOG_COMPLETO,
+            "⚠️ Se conserva el listado local porque quedan escrituras pendientes en la base de datos.",
+        )
+    else:
+        try:
+            exportar_base_datos_completa()
+        except Exception as e:
+            escribir_log(LOG_COMPLETO, f"⚠️ No se pudo exportar la base de datos al cierre: {e}")
     try:
         limpiar_listado()
     except Exception as e:
@@ -10626,6 +10952,14 @@ CODIGOS = {
         "No se pudo actualizar la base de datos",
         "Revisar conectividad y reintentar sincronización",
     ),
+    "AGENDA_REGISTRADA_DB": (
+        "El número de myphone se registró en la base de datos",
+        "Confirmar el contador registrados_desde_agenda en el resumen",
+    ),
+    "AGENDA_NO_REGISTRADA_DB": (
+        "El número de myphone no se registró en la base de datos",
+        "Revisar el motivo en datos.motivo y sincronizar después",
+    ),
     "PUERTO_COLGADO": (
         "Venció la barrera de espera del puerto",
         "Revisar USB y módem; no repetir indefinidamente",
@@ -10696,6 +11030,7 @@ def _reset_corrida():
     global _ussd_pendientes_cierre
     global _pasada_actual, _ronda_actual, _lote_actual, _etapa_actual, _db_estado
     global _sincronizados_db
+    global _registrados_desde_agenda
     global _descifrado_escrituras_desactivadas, _iccid_sync_rechazados
     global _proxy_claro_leido, _proxy_claro_config, _proxy_claro_caido
     global _proxy_claro_evento_emitido
@@ -10719,6 +11054,12 @@ def _reset_corrida():
         _puertos_respuesta_ussd.clear()
         _intentos_por_iccid.clear()
         _nuevos_activados.clear()
+        _db_pendientes_reintento.clear()
+        _agendas_pendientes_db.clear()
+        _agendas_en_listado.clear()
+        _iccid_desde_db.clear()
+        _registrados_desde_agenda = 0
+        _estado_sync_db.presupuesto_agotado = False
         _restaurados_v4.clear()
         _recuperados_diferido.clear()
         _sincronizados_db = 0
@@ -11311,7 +11652,8 @@ def construir_resumen_json():
         registros = {p: dict(_estado_flota.get(p, {})) for p in puertos}
         ultimo_codigo = dict(_ultimo_codigo_puerto)
         codigos = dict(_contador_codigos)
-        total_nuevos = len(_nuevos_activados)
+        total_nuevos = _contar_nuevos_activados()
+        total_agenda = _registrados_desde_agenda
         total_restaurados = len(_restaurados_v4 - _recuperados_diferido)
         duracion_etapas = dict(_tiempos_etapa)
         eventos_persistidos = _eventos_persistidos
@@ -11353,6 +11695,7 @@ def construir_resumen_json():
             "puertos": len(puertos),
             "activos": conteos["activo"],
             "nuevos_activados": total_nuevos,
+            "registrados_desde_agenda": total_agenda,
             "restaurados_fase0": total_restaurados,
             "ussd_enviados": intentos,
         },
