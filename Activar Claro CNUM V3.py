@@ -20,7 +20,7 @@ Solo soporte para activación de chips Claro.
 # ============================
 # 📌 Versión del script
 # ============================
-VERSION = "4.3.1"
+VERSION = "4.3.2"
 REPO_URL = "https://github.com/stgomoyaa/activar-claro.git"
 
 import time
@@ -1988,7 +1988,7 @@ def guardar_resultado(iccid, numero, puerto):
     except Exception as e:
         escribir_log(
             LOG_COMPLETO,
-            f"❌ [{puerto}] Error al guardar en la base de datos: {e}",
+            f"❌ [{puerto}] Error al guardar en la base de datos ({type(e).__name__})",
         )
 
 
@@ -2025,7 +2025,7 @@ def exportar_base_datos_completa():
     except Exception as e:
         escribir_log(
             LOG_COMPLETO,
-            f"❌ Error al exportar la base de datos: {e}",
+            f"❌ Error al exportar la base de datos ({type(e).__name__})",
         )
         return False
 
@@ -3753,6 +3753,37 @@ def _log_archivo_silencioso(mensaje):
             f.write(str(mensaje) + "\n")
     except Exception:
         pass
+
+
+_DB_CONFIG_EMBEBIDO = DB_CONFIG
+
+
+def _configurar_db():
+    global DB_CONFIG
+    DB_CONFIG = _DB_CONFIG_EMBEBIDO
+    fuente = "valor embebido"
+    programdata = os.environ.get("PROGRAMDATA")
+    if programdata:
+        ruta = Path(programdata) / "HeroSMS" / "claro_db.json"
+        try:
+            datos = json.loads(ruta.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, RecursionError):
+            datos = None
+        campos = ("host", "database", "user", "password")
+        if (
+            isinstance(datos, dict)
+            and all(
+                isinstance(datos.get(campo), str)
+                and datos[campo].strip()
+                and "\0" not in datos[campo]
+                for campo in campos
+            )
+            and type(datos.get("port")) is int
+            and 1 <= datos["port"] <= 65535
+        ):
+            DB_CONFIG = {campo: datos[campo] for campo in (*campos, "port")}
+            fuente = "archivo local"
+    _log_archivo_silencioso(f"Configuración BDD Claro: {fuente}")
 
 
 _console_print_original = console.print
@@ -5639,7 +5670,7 @@ def ejecutar_corrida(sin_ui=False):
         _reintentar_agendas_pendientes_db()
         _reintentar_escrituras_db_pendientes()
     except Exception as e:
-        escribir_log(LOG_COMPLETO, f"⚠️ Falló el reintento de escrituras en la base: {e}")
+        escribir_log(LOG_COMPLETO, f"⚠️ Falló el reintento de escrituras en la base ({type(e).__name__})")
     _guardar_listado_cierre()
     if _db_pendientes_reintento or _agendas_pendientes_db:
         escribir_log(
@@ -5650,7 +5681,7 @@ def ejecutar_corrida(sin_ui=False):
         try:
             exportar_base_datos_completa()
         except Exception as e:
-            escribir_log(LOG_COMPLETO, f"⚠️ No se pudo exportar la base de datos al cierre: {e}")
+            escribir_log(LOG_COMPLETO, f"⚠️ No se pudo exportar la base de datos al cierre ({type(e).__name__})")
     try:
         limpiar_listado()
     except Exception as e:
@@ -12041,6 +12072,7 @@ def main(sin_ui=False):
         _corrida_id, \
         _corrida_cerrada
     _reset_corrida()
+    _configurar_db()
     Path(__file__).resolve().with_name("LEEME_AGENTES.md").write_text(
         GUIA_AGENTES, encoding="utf-8"
     )
