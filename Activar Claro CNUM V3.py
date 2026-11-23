@@ -3758,31 +3758,45 @@ def _log_archivo_silencioso(mensaje):
 _DB_CONFIG_EMBEBIDO = DB_CONFIG
 
 
+def _leer_config_db_local():
+    programdata = os.environ.get("PROGRAMDATA")
+    if not programdata:
+        return None, "archivo ausente"
+    ruta = Path(programdata) / "HeroSMS" / "claro_db.json"
+    try:
+        datos = json.loads(ruta.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return None, "archivo ausente"
+    except OSError:
+        return None, "sin permiso de lectura"
+    except (ValueError, RecursionError):
+        return None, "JSON inválido o no es objeto"
+    if not isinstance(datos, dict):
+        return None, "JSON inválido o no es objeto"
+
+    campos_texto = ("host", "database", "user", "password")
+    campos = (*campos_texto, "port")
+    if any(campo not in datos for campo in campos):
+        return None, "faltan claves"
+    if (
+        any(
+            not isinstance(datos[campo], str)
+            or not datos[campo].strip()
+            or "\0" in datos[campo]
+            for campo in campos_texto
+        )
+        or type(datos["port"]) is not int
+        or not 1 <= datos["port"] <= 65535
+    ):
+        return None, "tipo inválido"
+    return {campo: datos[campo] for campo in campos}, None
+
+
 def _configurar_db():
     global DB_CONFIG
-    DB_CONFIG = _DB_CONFIG_EMBEBIDO
-    fuente = "valor embebido"
-    programdata = os.environ.get("PROGRAMDATA")
-    if programdata:
-        ruta = Path(programdata) / "HeroSMS" / "claro_db.json"
-        try:
-            datos = json.loads(ruta.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError, RecursionError):
-            datos = None
-        campos = ("host", "database", "user", "password")
-        if (
-            isinstance(datos, dict)
-            and all(
-                isinstance(datos.get(campo), str)
-                and datos[campo].strip()
-                and "\0" not in datos[campo]
-                for campo in campos
-            )
-            and type(datos.get("port")) is int
-            and 1 <= datos["port"] <= 65535
-        ):
-            DB_CONFIG = {campo: datos[campo] for campo in (*campos, "port")}
-            fuente = "archivo local"
+    config, causa = _leer_config_db_local()
+    DB_CONFIG = _DB_CONFIG_EMBEBIDO if config is None else config
+    fuente = "archivo local" if causa is None else f"valor embebido ({causa})"
     _log_archivo_silencioso(f"Configuración BDD Claro: {fuente}")
 
 
@@ -11139,6 +11153,10 @@ def _sanitizar(valor):
         secretos = [str(v) for v in DB_CONFIG.values() if v and len(str(v)) >= 4]
     except Exception:
         secretos = []
+    for config in (DB_CONFIG, _DB_CONFIG_EMBEBIDO):
+        clave = config.get("password")
+        if clave:
+            secretos.append(clave)
     try:
         if API_DESCIFRADO_AUTH:
             secretos.append(str(API_DESCIFRADO_AUTH))
@@ -11152,15 +11170,15 @@ def _sanitizar(valor):
     except Exception:
         pass
 
+    patron = "|".join(map(re.escape, sorted({s for s in secretos if s}, key=len, reverse=True)))
+
     def limpiar_escalar(item):
         texto = (
             item.decode("utf-8", errors="replace")
             if isinstance(item, bytes)
             else str(item)
         )
-        limpio = texto
-        for secreto in secretos:
-            limpio = limpio.replace(secreto, "[REDACTADO]")
+        limpio = re.sub(patron, "[REDACTADO]", texto) if patron else texto
         if limpio == texto:
             return item
         return limpio
